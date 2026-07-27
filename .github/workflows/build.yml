@@ -1,0 +1,44 @@
+name: Build Cross-Platform Binaries
+on: [push]
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # Runs parallel jobs on native macOS and Windows runners
+        os: [macos-latest, windows-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          # pip install -r requirements.txt
+
+      # Conditional build step for macOS
+      - name: Build macOS Binary
+        if: matrix.os == 'macos-latest'
+        run: pyinstaller --onefile your_script.py
+
+      # Conditional build step for Windows (.exe extension)
+      - name: Build Windows Binary
+        if: matrix.os == 'windows-latest'
+        run: pyinstaller --onefile --windowed your_script.py
+
+      # Uploads the final file back to your GitHub action page
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.os }}
+          path: dist/
+
