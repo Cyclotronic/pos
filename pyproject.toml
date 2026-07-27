@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://example.com"
+"Homepage" = "https://github.com/Cyclotronic/pos"
 
 [project.scripts]
 pos = "pos:main"
