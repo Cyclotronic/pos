@@ -28,12 +28,12 @@ jobs:
       # Conditional build step for macOS
       - name: Build macOS Binary
         if: matrix.os == 'macos-latest'
-        run: pyinstaller --onefile your_script.py
+        run: pyinstaller --onefile pos.py
 
       # Conditional build step for Windows (.exe extension)
       - name: Build Windows Binary
         if: matrix.os == 'windows-latest'
-        run: pyinstaller --onefile --windowed your_script.py
+        run: pyinstaller --onefile --windowed pos.py
 
       # Uploads the final file back to your GitHub action page
       - name: Upload Binary Artifact
