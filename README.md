@@ -1,27 +1,26 @@
 # Prologix OpenGPIB Scanner
 
-A starter Python app for scanning and managing OpenGPIB devices using a Tkinter GUI, serial ports, network requests, SQLite storage, and CSV/JSON exports.
+Built and tested on Windows. Supports Prologix USB and Ethernet Adatpers.
+Its a simple script that will scan for com ports, let you select one and then scan for devices attacked to the GPIB bus. It enumerates them an creates a sqlite DB allowing you to also export to CSV. This is script I use to find my devices and keep track of my used addresses on more than one GPIB.
+
+There is also some TestController functions that allow me to see if there's a device configuration for the devices I have on my GPIBes.
+
+It's simple, uses Tkinter GUI, serial ports, network requests, SQLite storage, and CSV/JSON exports.
 
 ## Features
 
 - Tkinter desktop UI
-- Serial port enumeration and OpenGPIB command support
-- Network request helper for remote queries
+- Serial port and Ethernet Prologix enumeration
+- Prologix configuration panels
+- Network broadcast to discover your Prologix Controllers in case of DHCP
 - SQLite persistence for scan sessions and device data
 - CSV and JSON export utilities
-
-## Install
-
-```bash
-python -m pip install -e .
-```
 
 ## Run
 
 ```bash
-python -m pogpib_scanner
+python pos.py
 ```
 
 ## Package name
-
-The package is installed as `pogpib_scanner` and provides the entrypoint script `pogpib-scanner`.
+pos.py

@@ -1,20 +1,25 @@
 [project]
-name = "pogpib_scanner"
-version = "0.1.0"
-description = "Prologix OpenGPIB Scanner GUI for serial, network, SQLite, CSV, and JSON support."
+name = "pos"
+dynamic = ["version"]
+description = "Prologix OpenGPIB Scanner and GPIB enumerator."
 readme = "README.md"
-authors = [{ name = "Auto-generated", email = "" }]
+authors = [{ name = "Auto-generated" }]
 requires-python = ">=3.10"
 dependencies = [
-    "pyserial>=3.5",
-    "requests>=2.30"
+    "pyserial>=3.5"
 ]
 
 [project.urls]
 "Homepage" = "https://example.com"
 
 [project.scripts]
-pogpib-scanner = "pogpib_scanner.__main__:main"
+pos = "pos:main"
+
+[tool.setuptools]
+py-modules = ["pos"]
+
+[tool.setuptools.dynamic]
+version = { attr = "pos.__version__" }
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
