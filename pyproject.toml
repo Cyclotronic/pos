@@ -1,0 +1,21 @@
+[project]
+name = "pogpib_scanner"
+version = "0.1.0"
+description = "Prologix OpenGPIB Scanner GUI for serial, network, SQLite, CSV, and JSON support."
+readme = "README.md"
+authors = [{ name = "Auto-generated", email = "" }]
+requires-python = ">=3.10"
+dependencies = [
+    "pyserial>=3.5",
+    "requests>=2.30"
+]
+
+[project.urls]
+"Homepage" = "https://example.com"
+
+[project.scripts]
+pogpib-scanner = "pogpib_scanner.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
