@@ -6,6 +6,7 @@ Its a simple script that will scan for com ports, let you select one and then sc
 There is also some TestController functions that allow me to see if there's a device configuration for the devices I have on my GPIBes.
 
 It's simple, uses Tkinter GUI, serial ports, network requests, SQLite storage, and CSV/JSON exports.
+All files are stored in same directory and you can run it as a python script or I've compiled it into a single file binary for Windows.
 
 ## Features
 
@@ -20,6 +21,10 @@ It's simple, uses Tkinter GUI, serial ports, network requests, SQLite storage, a
 
 ```bash
 python pos.py
+
+or
+
+pos.exe
 ```
 
 ## Package name
