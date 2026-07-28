@@ -1,5 +1,8 @@
 name: Build Cross-Platform Binaries
-on: [push]
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
 
 jobs:
   build:
@@ -7,7 +10,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        # Runs parallel jobs on native macOS and Windows runners
         os: [macos-latest, windows-latest]
 
     steps:
@@ -22,23 +24,24 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller
-          # pip install -r requirements.txt
+          pip install pyserial pyinstaller
 
-      # Conditional build step for macOS
       - name: Build macOS Binary
         if: matrix.os == 'macos-latest'
-        run: pyinstaller --onefile pos.py
+        run: pyinstaller --onefile --windowed --name pos pos.py
 
-      # Conditional build step for Windows (.exe extension)
       - name: Build Windows Binary
         if: matrix.os == 'windows-latest'
-        run: pyinstaller --onefile --windowed pos.py
+        run: pyinstaller --onefile --windowed --name pos pos.py
 
-      # Uploads the final file back to your GitHub action page
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4.6.1
         with:
           name: binary-${{ matrix.os }}
           path: dist/
 
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

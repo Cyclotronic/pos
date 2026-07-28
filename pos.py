@@ -13,6 +13,8 @@ import datetime
 import sys
 import json
 
+__version__ = "1.0.0"
+
 # ================= GLOBAL CONSTANTS =================
 DB_NAME = "gpib_devices.db"
 CONFIG_FILE = "scanner_config.json"
@@ -882,8 +884,9 @@ class PrologixMultiScannerApp:
             if self.root.winfo_exists():
                 self.root.after(0, lambda: status_lbl.config(text="Status: Configuration Read Successfully", foreground="#5ca86c"))
         except Exception as e:
+            msg = str(e)
             if self.root.winfo_exists():
-                self.root.after(0, lambda: status_lbl.config(text=f"Status: Read Error - {str(e)}", foreground="#a85c5c"))
+                self.root.after(0, lambda m=msg: status_lbl.config(text=f"Status: Read Error - {m}", foreground="#a85c5c"))
 
     def update_widget_value(self, widget, val):
         if not val: return
@@ -914,8 +917,9 @@ class PrologixMultiScannerApp:
             if self.root.winfo_exists():
                 self.root.after(0, lambda: status_lbl.config(text="Status: Configuration Applied Successfully", foreground="#5ca86c"))
         except Exception as e:
+            msg = str(e)
             if self.root.winfo_exists():
-                self.root.after(0, lambda: status_lbl.config(text=f"Status: Apply Error - {str(e)}", foreground="#a85c5c"))
+                self.root.after(0, lambda m=msg: status_lbl.config(text=f"Status: Apply Error - {m}", foreground="#a85c5c"))
 
     def set_scanner_defaults(self, config_widgets):
         config_widgets['++mode'].set("1 (Controller)")
@@ -1012,9 +1016,12 @@ class PrologixMultiScannerApp:
 
 dprint("Classes loaded. Launching application...")
 
-if __name__ == "__main__":
+def main():
     dprint("Initializing Tkinter root window...")
     root = tk.Tk()
     app = PrologixMultiScannerApp(root)
     dprint("Handing control to Tkinter mainloop. The GUI should now be visible on your screen.")
     root.mainloop()
+
+if __name__ == "__main__":
+    main()

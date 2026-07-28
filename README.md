@@ -1,31 +1,36 @@
 # Prologix OpenGPIB Scanner
 
-Built and tested on Windows. Supports Prologix USB and Ethernet Adatpers.
-Its a simple script that will scan for com ports, let you select one and then scan for devices attacked to the GPIB bus. It enumerates them an creates a sqlite DB allowing you to also export to CSV. This is script I use to find my devices and keep track of my used addresses on more than one GPIB.
+Built and tested on Windows. Supports Prologix USB and Ethernet adapters.
+A simple tool that scans for COM ports, lets you select one, and then scans for
+devices attached to the GPIB bus. It enumerates them and creates a SQLite database,
+with export to CSV/JSON. This is the tool I use to find my devices and keep track
+of my used addresses across more than one GPIB bus.
 
-There is also some TestController functions that allow me to see if there's a device configuration for the devices I have on my GPIBes.
+There are also TestController integration functions that check whether a device
+configuration exists for the instruments found on your buses.
 
-It's simple, uses Tkinter GUI, serial ports, network requests, SQLite storage, and CSV/JSON exports.
-All files are stored in same directory and you can run it as a python script or I've compiled it into a single file binary for Windows.
+Uses a Tkinter GUI, serial ports, network discovery, SQLite storage, and CSV/JSON
+exports. All files are stored in the same directory as the program.
 
 ## Features
 
 - Tkinter desktop UI
 - Serial port and Ethernet Prologix enumeration
 - Prologix configuration panels
-- Network broadcast to discover your Prologix Controllers in case of DHCP
+- Network broadcast to discover your Prologix controllers in case of DHCP
 - SQLite persistence for scan sessions and device data
 - CSV and JSON export utilities
 
 ## Run
 
-```bash
-python pos.py
+From source (requires Python 3.10+ and pyserial):
 
-or
+    pip install pyserial
+    python pos.py
 
-pos.exe
-```
+Or download a prebuilt binary from the
+[Releases page](https://github.com/Cyclotronic/pos/releases).
 
-## Package name
-pos.py
+## License
+
+MIT

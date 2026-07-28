@@ -3,7 +3,7 @@ name = "pos"
 dynamic = ["version"]
 description = "Prologix OpenGPIB Scanner and GPIB enumerator."
 readme = "README.md"
-authors = [{ name = "Auto-generated" }]
+authors = [{ name = "Cyclotronic" }]
 requires-python = ">=3.10"
 dependencies = [
     "pyserial>=3.5"
