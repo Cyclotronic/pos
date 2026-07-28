@@ -12,7 +12,8 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
-
+gpib_devices.db
+scanner_config.json
 # Python
 pip-wheel-metadata/
 /*.egg-info/

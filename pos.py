@@ -13,11 +13,19 @@ import datetime
 import sys
 import json
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 # ================= GLOBAL CONSTANTS =================
-DB_NAME = "gpib_devices.db"
-CONFIG_FILE = "scanner_config.json"
+
+# Anchor data files to the program's own directory (script or frozen exe),
+# so the DB/config don't scatter based on the launch directory.
+if getattr(sys, 'frozen', False):
+    _APP_DIR = os.path.dirname(sys.executable)
+else:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DB_NAME = os.path.join(_APP_DIR, "gpib_devices.db")
+CONFIG_FILE = os.path.join(_APP_DIR, "scanner_config.json")
 DB_TIMEOUT = 5.0  # Seconds to wait if database is locked by another thread
 PROLOGIX_TCP_PORT = 1234
 NETFINDER_UDP_PORT = 3040
@@ -29,6 +37,22 @@ def dprint(*args, **kwargs):
     """Custom print function that only outputs if --debug flag is passed."""
     if DEBUG_MODE:
         print(*args, **kwargs)
+
+def decode_status_byte(sb):
+    """Formats a serial-poll status byte with decoded IEEE-488 flag bits.
+    SRQ = device requesting service, ESB = event/error summary (488.2),
+    MAV = message available (unread data in the output queue)."""
+    if sb is None or sb == "":
+        return ""
+    try:
+        sb = int(sb)
+    except (TypeError, ValueError):
+        return ""
+    flags = []
+    if sb & 0x40: flags.append("SRQ")
+    if sb & 0x20: flags.append("ESB")
+    if sb & 0x10: flags.append("MAV")
+    return f"0x{sb:02X}" + (f" ({','.join(flags)})" if flags else "")
 
 # ================= CONFIGURATION SETUP =================
 
@@ -79,6 +103,12 @@ def init_db():
             cursor.execute("ALTER TABLE devices ADD COLUMN tc_config_file TEXT")
         except sqlite3.OperationalError:
             pass # Column already exists
+
+        # Migration: Add status_byte column (serial poll result) if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE devices ADD COLUMN status_byte INTEGER")
+        except sqlite3.OperationalError:
+            pass # Column already exists
             
         conn.commit()
 
@@ -92,7 +122,7 @@ def upsert_devices_batch(devices_list):
     with sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT) as conn:
         cursor = conn.cursor()
         for dev in devices_list:
-            adapter_type, port, serial_num, gpib_addr, idn_response, status = dev
+            adapter_type, port, serial_num, gpib_addr, idn_response, status, status_byte = dev
             
             cursor.execute('''
                 SELECT id FROM devices 
@@ -103,14 +133,14 @@ def upsert_devices_batch(devices_list):
             if row:
                 cursor.execute('''
                     UPDATE devices 
-                    SET idn_response = ?, status = ?, last_seen = ?, adapter_type = ?, connection_port = ?
+                    SET idn_response = ?, status = ?, last_seen = ?, adapter_type = ?, connection_port = ?, status_byte = ?
                     WHERE id = ?
-                ''', (idn_response, status, now, adapter_type, port, row[0]))
+                ''', (idn_response, status, now, adapter_type, port, status_byte, row[0]))
             else:
                 cursor.execute('''
-                    INSERT INTO devices (adapter_type, connection_port, adapter_serial, gpib_address, idn_response, status, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (adapter_type, port, serial_num, gpib_addr, idn_response, status, now))
+                    INSERT INTO devices (adapter_type, connection_port, adapter_serial, gpib_address, idn_response, status, last_seen, status_byte)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (adapter_type, port, serial_num, gpib_addr, idn_response, status, now, status_byte))
         conn.commit()
 
 def mark_missing_devices(serial_num, found_addresses):
@@ -135,9 +165,9 @@ def fetch_all_devices(adapter_serial=None):
     with sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT) as conn:
         cursor = conn.cursor()
         if adapter_serial:
-            cursor.execute("SELECT adapter_type, connection_port, adapter_serial, gpib_address, idn_response, status, last_seen, tc_config_file FROM devices WHERE adapter_serial = ?", (adapter_serial,))
+            cursor.execute("SELECT adapter_type, connection_port, adapter_serial, gpib_address, idn_response, status, last_seen, tc_config_file, status_byte FROM devices WHERE adapter_serial = ?", (adapter_serial,))
         else:
-            cursor.execute("SELECT adapter_type, connection_port, adapter_serial, gpib_address, idn_response, status, last_seen, tc_config_file FROM devices")
+            cursor.execute("SELECT adapter_type, connection_port, adapter_serial, gpib_address, idn_response, status, last_seen, tc_config_file, status_byte FROM devices")
         return cursor.fetchall()
 
 def delete_device_records(records):
@@ -166,6 +196,7 @@ class PrologixAdapter:
         self.serial_num = serial_num
     def write(self, command): pass
     def read(self): pass
+    def flush_input(self): pass
     def close(self): pass
 
 class USBAdapter(PrologixAdapter):
@@ -184,6 +215,13 @@ class USBAdapter(PrologixAdapter):
             return self.ser.readline().decode('ascii').strip()
         except serial.SerialException:
             return ""
+
+    def flush_input(self):
+        """Discards any stale/late data sitting in the receive buffer."""
+        try:
+            self.ser.reset_input_buffer()
+        except serial.SerialException as e:
+            dprint(f"USB flush error: {e}")
         
     def close(self):
         try:
@@ -220,7 +258,22 @@ class EthernetAdapter(PrologixAdapter):
             
         except (socket.timeout, TimeoutError, OSError):
             return ""
-            
+
+    def flush_input(self):
+        """Discards any stale/late data sitting in the receive buffer."""
+        try:
+            self.sock.setblocking(False)
+            while True:
+                try:
+                    chunk = self.sock.recv(1024)
+                    if not chunk:
+                        break
+                except (BlockingIOError, OSError):
+                    break
+        finally:
+            # Restore the normal blocking timeout for subsequent reads
+            self.sock.settimeout(0.5)
+
     def close(self):
         try:
             if self.sock:
@@ -236,6 +289,7 @@ class TestControllerIntegration(tk.Toplevel):
         super().__init__(parent)
         self.title("TestController Integration")
         self.geometry("950x650")
+        self.minsize(700, 450)
         self.parent_app = parent_app
         
         # Muted background
@@ -270,6 +324,19 @@ class TestControllerIntegration(tk.Toplevel):
         self.scan_btn = ttk.Button(settings_frame, text="Match Discovered Devices", command=self.match_devices, state='disabled')
         self.scan_btn.grid(row=2, column=0, columnspan=3, pady=15)
 
+        # Pack the action bar BEFORE the expanding list frame, anchored to the
+        # bottom. Pack allocates space in packing order, so this guarantees the
+        # buttons keep their strip; the treeview then expands into what's left
+        # and scrolls, instead of growing and pushing the buttons off-screen.
+        action_frame = ttk.Frame(self, padding=20)
+        action_frame.pack(fill=tk.X, side=tk.BOTTOM)
+
+        self.accept_btn = ttk.Button(action_frame, text="Accept & Update DB", command=self.accept_matches, state='disabled')
+        self.accept_btn.pack(side=tk.RIGHT, padx=5)
+
+        self.cancel_btn = ttk.Button(action_frame, text="Ignore & Close", command=self.cancel_matches)
+        self.cancel_btn.pack(side=tk.RIGHT, padx=5)
+
         list_frame = ttk.LabelFrame(self, text="Discovered Devices & Matching TC Configs (Preview)", padding=15)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
 
@@ -297,15 +364,6 @@ class TestControllerIntegration(tk.Toplevel):
         
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        action_frame = ttk.Frame(self, padding=20)
-        action_frame.pack(fill=tk.X)
-        
-        self.accept_btn = ttk.Button(action_frame, text="Accept & Update DB", command=self.accept_matches, state='disabled')
-        self.accept_btn.pack(side=tk.RIGHT, padx=5)
-        
-        self.cancel_btn = ttk.Button(action_frame, text="Ignore & Close", command=self.cancel_matches)
-        self.cancel_btn.pack(side=tk.RIGHT, padx=5)
 
     def apply_ui_state(self):
         state = 'normal' if self.integration_enabled.get() else 'disabled'
@@ -545,12 +603,13 @@ class PrologixMultiScannerApp:
         
         ttk.Button(btn_frame, text="Refresh View", command=self.refresh_db_view).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="Export All to CSV", command=lambda: self.export_csv(None)).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Export All to JSON", command=lambda: self.export_json(None)).pack(side="left", padx=5)
         
         # Updated to reflect multi-select functionality
         ttk.Button(btn_frame, text="Delete Selected Record(s)", command=self.delete_db_record).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="TestController Integration", command=self.open_tc_integration).pack(side="left", padx=5)
         
-        columns = ("Type", "Port/IP", "Adapter Serial", "GPIB", "IDN Response", "Status", "Last Seen", "TC Config")
+        columns = ("Type", "Port/IP", "Adapter Serial", "GPIB", "IDN Response", "Status", "Last Seen", "TC Config", "SPoll")
         self.db_tree = ttk.Treeview(self.db_frame, columns=columns, show="headings")
         
         # Apply softer Zebra Striping Tags
@@ -564,6 +623,7 @@ class PrologixMultiScannerApp:
         self.db_tree.column("IDN Response", width=250)
         self.db_tree.column("TC Config", width=200)
         self.db_tree.column("GPIB", width=60, anchor="center")
+        self.db_tree.column("SPoll", width=110, anchor="center")
         self.db_tree.pack(fill="both", expand=True, padx=20, pady=10)
         
         self.refresh_db_view()
@@ -577,7 +637,8 @@ class PrologixMultiScannerApp:
         rows = fetch_all_devices()
         for i, row in enumerate(rows):
             tag = 'evenrow' if i % 2 == 0 else 'oddrow'
-            self.db_tree.insert("", tk.END, values=row, tags=(tag,))
+            display = list(row[:8]) + [decode_status_byte(row[8])]
+            self.db_tree.insert("", tk.END, values=display, tags=(tag,))
 
     def delete_db_record(self):
         """Allows deletion of one or multiple selected records from the database view."""
@@ -628,6 +689,7 @@ class PrologixMultiScannerApp:
     def udp_discover_thread(self):
         dprint("\n--- STARTING NETFINDER UDP DISCOVERY ---")
         discovered_options = []
+        sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -636,7 +698,7 @@ class PrologixMultiScannerApp:
             discovery_packet = bytes.fromhex("5A 00 5A 9E FF FF FF FF FF FF 00 00")
             
             try: sock.sendto(discovery_packet, ('255.255.255.255', NETFINDER_UDP_PORT))
-            except: pass
+            except OSError: pass
             
             try:
                 hostname = socket.gethostname()
@@ -646,8 +708,8 @@ class PrologixMultiScannerApp:
                     if len(parts) == 4:
                         subnet_bcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
                         try: sock.sendto(discovery_packet, (subnet_bcast, NETFINDER_UDP_PORT))
-                        except: pass
-            except: pass
+                        except OSError: pass
+            except OSError: pass
 
             while True:
                 try:
@@ -664,9 +726,10 @@ class PrologixMultiScannerApp:
                         if display_str not in discovered_options:
                             discovered_options.append(display_str)
                 except socket.timeout: break 
-                except: break
+                except OSError: break
         finally:
-            sock.close()
+            if sock is not None:
+                sock.close()
             
         if self.root.winfo_exists():
             self.root.after(0, lambda: self.finish_netfinder_discovery(discovered_options))
@@ -684,6 +747,74 @@ class PrologixMultiScannerApp:
 
     # --- Connection & Tab Creation Methods ---
 
+    def validate_adapter(self, adapter, location_desc):
+        """Validates a controller via ++ver. Returns True to keep it, False to close it.
+
+        A Prologix-compatible controller has two testable properties:
+          1. It is SILENT unless queried (a streaming device fails this), and
+          2. It answers the same query with the same response every time
+             (a streaming device's 'responses' are just whatever data happened
+             to be in flight, so they differ between queries).
+        Genuine Prologix is accepted immediately; a consistent non-Prologix
+        responder (e.g. AR488) gets a connect-anyway prompt."""
+
+        # Let the device settle after port-open (some controllers, e.g.
+        # Arduino-based AR488, reset on open and emit boot text), then
+        # discard anything that arrived unprompted so far.
+        time.sleep(0.3)
+        adapter.flush_input()
+
+        # --- Check 1: Silence. Read with NO command sent. A controller
+        # returns nothing; a streaming device produces data anyway.
+        unsolicited = adapter.read().strip()
+        if unsolicited:
+            messagebox.showerror(
+                "Hardware Validation Failed",
+                f"The device at {location_desc} is transmitting data without "
+                f"being queried:\n\n'{unsolicited[:120]}'\n\n"
+                f"A Prologix-compatible controller only responds to commands. "
+                f"This looks like a different kind of serial device."
+            )
+            return False
+
+        # --- Check 2: Consistent answers to ++ver, queried twice.
+        responses = []
+        for _ in range(2):
+            adapter.flush_input()
+            adapter.write("++ver")
+            time.sleep(0.2)
+            responses.append(adapter.read().strip())
+        r1, r2 = responses
+
+        if not r1 and not r2:
+            messagebox.showerror(
+                "Hardware Validation Failed",
+                f"The device at {location_desc} did not respond to ++ver at all.\n"
+                f"It does not appear to be a Prologix-compatible controller."
+            )
+            return False
+
+        if r1 != r2:
+            messagebox.showerror(
+                "Hardware Validation Failed",
+                f"The device at {location_desc} gave inconsistent responses to "
+                f"the same ++ver query:\n\n'{r1[:80]}'\n'{r2[:80]}'\n\n"
+                f"A controller answers identically each time; this looks like "
+                f"a device streaming unrelated data."
+            )
+            return False
+
+        if "Prologix" in r1:
+            return True
+
+        # Consistent, non-empty, non-Prologix: likely a compatible clone.
+        return messagebox.askyesno(
+            "Unrecognized Controller",
+            f"The device at {location_desc} responded consistently to ++ver "
+            f"but did not identify as Prologix:\n\n'{r1}'\n\n"
+            f"This may be a compatible controller (e.g. AR488). Connect anyway?"
+        )
+
     def connect_usb(self):
         selection = self.com_combo.get()
         if not selection or "No COM ports" in selection:
@@ -693,24 +824,11 @@ class PrologixMultiScannerApp:
         serial_num = self.usb_serials.get(port, f"Unknown_{port}")
         
         try:
-            # Instantiate adapter silently
             adapter = USBAdapter(port, serial_num)
-            
-            # --- Hardware Validation Step ---
-            # Send the ++ver command to check if it's genuinely a Prologix controller
-            adapter.write("++ver")
-            time.sleep(0.2)
-            version_response = adapter.read()
-            
-            if "Prologix" not in version_response:
+
+            if not self.validate_adapter(adapter, port):
                 adapter.close()
-                messagebox.showerror(
-                    "Hardware Validation Failed", 
-                    f"The device on {port} did not respond as a Prologix controller.\n\n"
-                    f"Expected 'Prologix' in response.\nReceived: '{version_response}'"
-                )
                 return
-            # --- End Validation ---
 
             self.active_adapters.append(adapter)
             self.create_adapter_tab(adapter)
@@ -728,21 +846,10 @@ class PrologixMultiScannerApp:
         
         try:
             adapter = EthernetAdapter(ip, mac_addr)
-            
-            # --- Hardware Validation Step ---
-            adapter.write("++ver")
-            time.sleep(0.2)
-            version_response = adapter.read()
-            
-            if "Prologix" not in version_response:
+
+            if not self.validate_adapter(adapter, ip):
                 adapter.close()
-                messagebox.showerror(
-                    "Hardware Validation Failed", 
-                    f"The device at {ip} did not respond as a Prologix controller.\n\n"
-                    f"Expected 'Prologix' in response.\nReceived: '{version_response}'"
-                )
                 return
-            # --- End Validation ---
 
             self.active_adapters.append(adapter)
             self.create_adapter_tab(adapter)
@@ -765,11 +872,14 @@ class PrologixMultiScannerApp:
 
         scan_frame = ttk.Frame(inner_notebook)
         config_frame = ttk.Frame(inner_notebook)
+        term_frame = ttk.Frame(inner_notebook)
         inner_notebook.add(scan_frame, text="Device Scanner")
         inner_notebook.add(config_frame, text="Adapter Configuration (Optional)")
+        inner_notebook.add(term_frame, text="Terminal")
+        self.build_terminal_tab(term_frame, adapter)
 
         # ================= SCANNER UI =================
-        ttk.Label(scan_frame, text="Note: Valid scans require the adapter to be configured as Mode: Controller, Auto: Disable, EOS: None.", foreground="#a85c5c").pack(pady=10)
+        ttk.Label(scan_frame, text="Note: The scan automatically sets Mode: Controller, Auto: Disable, EOS: None, EOI: Enable for the session (not saved to EEPROM).", foreground="#5b7c99").pack(pady=10)
         
         ctrl_frame = ttk.Frame(scan_frame)
         ctrl_frame.pack(fill="x", padx=20, pady=10)
@@ -778,10 +888,11 @@ class PrologixMultiScannerApp:
         btn_scan.pack(side="left", padx=5)
         
         ttk.Button(ctrl_frame, text="Export CSV", command=lambda a=adapter: self.export_csv(a.serial_num)).pack(side="left", padx=5)
+        ttk.Button(ctrl_frame, text="Export JSON", command=lambda a=adapter: self.export_json(a.serial_num)).pack(side="left", padx=5)
         progress = ttk.Progressbar(ctrl_frame, orient="horizontal", length=400, mode="determinate")
         progress.pack(side="left", padx=25, pady=5)
         
-        columns = ("Type", "Port", "Serial", "GPIB", "IDN Response", "Status", "Last Seen")
+        columns = ("Type", "Port", "Serial", "GPIB", "IDN Response", "Status", "Last Seen", "SPoll")
         tree = ttk.Treeview(scan_frame, columns=columns, show="headings")
         
         # Setup Zebra Striping
@@ -790,6 +901,7 @@ class PrologixMultiScannerApp:
         
         for col in columns: tree.heading(col, text=col); tree.column(col, width=120)
         tree.column("IDN Response", width=250); tree.column("GPIB", width=60, anchor="center")
+        tree.column("SPoll", width=110, anchor="center")
         tree.pack(fill="both", expand=True, padx=20, pady=10)
         
         self.populate_adapter_tree(tree, adapter.serial_num)
@@ -867,6 +979,114 @@ class PrologixMultiScannerApp:
 
         self.run_read_config(adapter, config_widgets, lbl_cfg_status)
 
+
+    # --- Interactive Terminal ---
+
+    def build_terminal_tab(self, parent, adapter):
+        ttk.Label(parent, text="Send raw ++ controller commands or SCPI to the addressed instrument. "
+                               "SCPI queries (containing '?') are read back automatically. "
+                               "Up/Down arrows recall command history.",
+                  foreground="#5b7c99", wraplength=900).pack(pady=8, padx=20)
+
+        addr_frame = ttk.Frame(parent)
+        addr_frame.pack(fill="x", padx=20, pady=(0, 5))
+        ttk.Label(addr_frame, text="Target GPIB Address:").pack(side="left")
+        ent_addr = ttk.Entry(addr_frame, width=6)
+        ent_addr.pack(side="left", padx=8)
+
+        log_frame = ttk.Frame(parent)
+        log_frame.pack(fill="both", expand=True, padx=20, pady=5)
+        log = tk.Text(log_frame, state="disabled", bg="#ffffff", fg="#343a40",
+                      font=("Consolas", 10), wrap="word", borderwidth=1, relief="solid")
+        log_sb = ttk.Scrollbar(log_frame, orient="vertical", command=log.yview)
+        log.configure(yscrollcommand=log_sb.set)
+        log.pack(side="left", fill="both", expand=True)
+        log_sb.pack(side="right", fill="y")
+
+        input_frame = ttk.Frame(parent, padding=(0, 5))
+        input_frame.pack(fill="x", padx=20, pady=(0, 15))
+        entry = ttk.Entry(input_frame, font=("Consolas", 10))
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        history = []
+        hist_pos = [0]
+
+        def do_send(event=None):
+            cmd = entry.get().strip()
+            if not cmd:
+                return
+            history.append(cmd)
+            hist_pos[0] = len(history)
+            entry.delete(0, tk.END)
+            addr = ent_addr.get().strip()
+            self.terminal_send(adapter, cmd, addr, log)
+
+        def hist_up(event):
+            if history and hist_pos[0] > 0:
+                hist_pos[0] -= 1
+                entry.delete(0, tk.END)
+                entry.insert(0, history[hist_pos[0]])
+            return "break"
+
+        def hist_down(event):
+            if hist_pos[0] < len(history) - 1:
+                hist_pos[0] += 1
+                entry.delete(0, tk.END)
+                entry.insert(0, history[hist_pos[0]])
+            else:
+                hist_pos[0] = len(history)
+                entry.delete(0, tk.END)
+            return "break"
+
+        entry.bind("<Return>", do_send)
+        entry.bind("<Up>", hist_up)
+        entry.bind("<Down>", hist_down)
+
+        ttk.Button(input_frame, text="Send", command=do_send).pack(side="left", padx=4)
+
+        def clear_log():
+            log.config(state="normal")
+            log.delete("1.0", tk.END)
+            log.config(state="disabled")
+        ttk.Button(input_frame, text="Clear", command=clear_log).pack(side="left", padx=4)
+
+    def terminal_send(self, adapter, cmd, addr, log_widget):
+        threading.Thread(target=self._terminal_send_thread,
+                         args=(adapter, cmd, addr, log_widget), daemon=True).start()
+
+    def _terminal_send_thread(self, adapter, cmd, addr, log_widget):
+        try:
+            adapter.flush_input()
+            if addr and not cmd.startswith("++"):
+                adapter.write(f"++addr {addr}")
+            self._term_log(log_widget, f"> {cmd}")
+            adapter.write(cmd)
+            if cmd.startswith("++"):
+                # Controller commands: query forms reply, set forms don't.
+                time.sleep(0.1)
+                resp = adapter.read().strip()
+                self._term_log(log_widget, f"< {resp}" if resp else "< (no response)")
+            elif "?" in cmd:
+                # SCPI query: trigger a bus read for the answer
+                adapter.write("++read eoi")
+                time.sleep(0.1)
+                resp = adapter.read().strip()
+                self._term_log(log_widget, f"< {resp}" if resp else "< (no response / timeout)")
+            # SCPI non-query commands produce no reply; nothing to read.
+        except Exception as e:
+            self._term_log(log_widget, f"! Error: {e}")
+
+    def _term_log(self, log_widget, line):
+        def append():
+            if not log_widget.winfo_exists():
+                return
+            log_widget.config(state="normal")
+            log_widget.insert(tk.END, line + "\n")
+            log_widget.see(tk.END)
+            log_widget.config(state="disabled")
+        if self.root.winfo_exists():
+            self.root.after(0, append)
+
     # --- Configuration Methods ---
 
     def run_read_config(self, adapter, config_widgets, status_lbl):
@@ -911,8 +1131,14 @@ class PrologixMultiScannerApp:
 
     def apply_config_thread(self, adapter, config_values, status_lbl):
         try:
+            # Send ++savecfg last: once savecfg is enabled, every subsequent
+            # config command triggers an EEPROM write (limited write cycles).
+            savecfg_val = config_values.pop("++savecfg", None)
             for cmd, val in config_values.items():
                 adapter.write(f"{cmd} {val}")
+                time.sleep(0.05)
+            if savecfg_val is not None:
+                adapter.write(f"++savecfg {savecfg_val}")
                 time.sleep(0.05)
             if self.root.winfo_exists():
                 self.root.after(0, lambda: status_lbl.config(text="Status: Configuration Applied Successfully", foreground="#5ca86c"))
@@ -953,7 +1179,8 @@ class PrologixMultiScannerApp:
         rows = fetch_all_devices(serial_num)
         for i, row in enumerate(rows):
             tag = 'evenrow' if i % 2 == 0 else 'oddrow'
-            tree.insert("", tk.END, values=row[:7], tags=(tag,))
+            display = list(row[:7]) + [decode_status_byte(row[8])]
+            tree.insert("", tk.END, values=display, tags=(tag,))
 
     def run_bus_scan(self, adapter, tree, progress, btn):
         btn.config(state="disabled")
@@ -964,24 +1191,61 @@ class PrologixMultiScannerApp:
     def scan_thread(self, adapter, tree, progress, btn):
         found_devices = []
         found_gpib_addrs = []
-        
+
+        # Enforce scan preconditions (session-only; deliberately no ++savecfg).
+        # ++read_tmo_ms MUST be shorter than the 0.5s transport read timeout,
+        # otherwise late replies arrive in the NEXT iteration's read and cause
+        # phantom/duplicated devices at the wrong addresses.
+        adapter.write("++mode 1")
+        adapter.write("++auto 0")
+        adapter.write("++eos 3")
+        adapter.write("++eoi 1")
+        adapter.write("++read_tmo_ms 200")
+        time.sleep(0.2)
+        adapter.flush_input()
+
+        # Phase 1: fast presence detection via serial poll (IEEE-488.1).
+        # Every GPIB device answers spoll at the interface-chip level, so this
+        # is safe for pre-488.2 instruments and much faster on empty addresses.
+        # A valid spoll reply is a decimal status byte (0-255); anything else
+        # is stale data or an error string and is NOT treated as presence.
+        present = []
+        status_bytes = {}
         for addr in range(31):
             if not self.root.winfo_exists():
                 return
-            
-            adapter.write(f"++addr {addr}") 
-            adapter.write("*IDN?")
-            adapter.write("++read eoi")
-            
-            response = adapter.read()
-            
-            if response:
-                found_gpib_addrs.append(addr)
-                found_devices.append((adapter.adapter_type, adapter.port_or_ip, adapter.serial_num, addr, response, "Found"))
-            
+
+            adapter.flush_input()
+            adapter.write(f"++spoll {addr}")
+            response = adapter.read().strip()
+            dprint(f"spoll {addr}: '{response}'")
+
+            if response.isdigit() and 0 <= int(response) <= 255:
+                present.append(addr)
+                status_bytes[addr] = int(response)
+
             if self.root.winfo_exists():
                 self.root.after(0, lambda val=addr: progress.configure(value=val))
-            
+
+        dprint(f"Present addresses: {present}")
+
+        # Phase 2: identify only the devices that answered the poll
+        for addr in present:
+            if not self.root.winfo_exists():
+                return
+
+            adapter.flush_input()
+            adapter.write(f"++addr {addr}")
+            adapter.write("*IDN?")
+            adapter.write("++read eoi")
+
+            response = adapter.read().strip()
+            dprint(f"*IDN? {addr}: '{response}'")
+
+            idn = response if response else "(present, no *IDN? response - pre-488.2 device)"
+            found_gpib_addrs.append(addr)
+            found_devices.append((adapter.adapter_type, adapter.port_or_ip, adapter.serial_num, addr, idn, "Found", status_bytes.get(addr)))
+
         upsert_devices_batch(found_devices)
         mark_missing_devices(adapter.serial_num, found_gpib_addrs)
         
@@ -1008,11 +1272,35 @@ class PrologixMultiScannerApp:
             try:
                 with open(filepath, mode='w', newline='', encoding='utf-8') as file:
                     writer = csv.writer(file)
-                    writer.writerow(["Adapter Type", "Connection Port/IP", "Adapter Serial", "GPIB Address", "IDN Response", "Status", "Last Seen", "TC Config File"])
+                    writer.writerow(["Adapter Type", "Connection Port/IP", "Adapter Serial", "GPIB Address", "IDN Response", "Status", "Last Seen", "TC Config File", "Status Byte"])
                     writer.writerows(rows)
                 messagebox.showinfo("Success", f"Data exported successfully to {filepath}")
             except Exception as e:
                 messagebox.showerror("Export Error", f"Failed to save CSV:\n{e}")
+
+    def export_json(self, adapter_serial=None):
+        rows = fetch_all_devices(adapter_serial)
+        if not rows:
+            messagebox.showwarning("Export Empty", "No data available to export.")
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".json", filetypes=[("JSON files", "*.json"), ("All files", "*.*")], title="Save Export as JSON"
+        )
+        if filepath:
+            keys = ["adapter_type", "connection_port", "adapter_serial", "gpib_address",
+                    "idn_response", "status", "last_seen", "tc_config_file", "status_byte"]
+            data = []
+            for row in rows:
+                entry = dict(zip(keys, row))
+                entry["status_byte_decoded"] = decode_status_byte(row[8])
+                data.append(entry)
+            try:
+                with open(filepath, mode='w', encoding='utf-8') as file:
+                    json.dump(data, file, indent=2)
+                messagebox.showinfo("Success", f"Data exported successfully to {filepath}")
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Failed to save JSON:\n{e}")
 
 dprint("Classes loaded. Launching application...")
 
