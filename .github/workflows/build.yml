@@ -3,20 +3,30 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            arch: applesilicon
-          - os: macos-15-intel
-            arch: intel
+          - os: ubuntu-22.04
+            artifact: linux-x86_64
           - os: windows-latest
-            arch: windows
+            artifact: windows-x86_64
+          - os: macos-15
+            artifact: macos-x86_64
+          - os: macos-14
+            artifact: macos-arm64
 
     steps:
       - name: Check out repository
@@ -25,7 +35,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5.4.0
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Install Dependencies
         run: |
@@ -37,26 +47,39 @@ jobs:
         run: |
           pyinstaller --onefile --windowed --name pos pos.py
           cd dist
-          ditto -c -k --keepParent pos.app pos-macos-${{ matrix.arch }}.zip
+          zip -qry "../pos-${{ matrix.artifact }}.zip" pos.app pos
+          cd ..
+
+      - name: Build Linux Binary
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --onefile --name pos pos.py
+          tar -C dist -czf "pos-${{ matrix.artifact }}.tar.gz" pos
 
       - name: Build Windows Binary
         if: runner.os == 'Windows'
         run: |
           pyinstaller --onefile --windowed --name pos pos.py
-          Rename-Item dist/pos.exe pos-windows.exe
+          Compress-Archive -Path dist\pos.exe -DestinationPath "pos-${{ matrix.artifact }}.zip"
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4.6.1
         with:
-          name: binary-${{ matrix.os }}
+          name: binary-${{ matrix.artifact }}
           path: |
-            dist/pos-macos-*.zip
-            dist/pos-windows.exe
+            *.zip
+            *.tar.gz
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4.1.9
+        with:
+          path: artifacts
 
       - name: Publish Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.2.1
         with:
-          files: |
-            dist/pos-macos-*.zip
-            dist/pos-windows.exe
+          files: artifacts/**/*

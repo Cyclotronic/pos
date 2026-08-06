@@ -1,6 +1,6 @@
 # Prologix OpenGPIB Scanner
 
-Built and tested on Windows. Supports Prologix USB and Ethernet adapters.
+Built and tested on Windows, and runs natively on macOS and Linux. Supports Prologix USB and Ethernet adapters.
 A simple tool that scans for COM ports, lets you select one, and then scans for
 devices attached to the GPIB bus. It enumerates them and creates a SQLite database,
 with export to CSV/JSON. This is the tool I use to find my devices and keep track
@@ -12,12 +12,33 @@ configuration exists for the instruments found on your buses.
 Uses a Tkinter GUI, serial ports, network discovery, SQLite storage, and CSV/JSON
 exports. All files are stored in the same directory as the program.
 
+## Interface
+
+The window is a notebook. **Controllers** merges the serial ports it can see,
+the NetFinder replies it gets, and everything the database remembers, into one
+sortable table - green for answering now, blue for open, grey for recorded.
+Double-click a row and that controller opens in its own tab, which you close
+with Ctrl+W or the Close tab button. **Database** holds every record ever
+written, with the TestController matcher on its own sub-tab so its settings
+stay out of the way when the feature is off.
+
+A controller tab has three panes: **Bus inventory** (scan with a live log and a
+Stop button), **Configuration** (read and apply the adapter's own settings), and
+**Terminal** (raw ++ and SCPI, with history). A menu bar covers the file and
+scan actions, and the status bar along the bottom always shows which database
+is open.
+
+Every long operation runs on a worker thread that posts to a queue the Tk main
+loop drains, so the window never blocks and no thread touches a widget.
+
 ## Features
 
-- Tkinter desktop UI
-- Serial port and Ethernet Prologix enumeration
+- Tkinter desktop UI: menu bar, per-controller tabs, status bar, sortable tables
+- Serial port and Ethernet Prologix enumeration in a single merged view
 - Prologix configuration panels
 - Network broadcast to discover your Prologix controllers in case of DHCP
+- Two-phase bus scan (serial poll, then *IDN?) over a settable address range
+- Per-controller terminal with command history
 - SQLite persistence for scan sessions and device data
 - CSV and JSON export utilities
 
@@ -27,6 +48,9 @@ From source (requires Python 3.10+ and pyserial):
 
     pip install pyserial
     python pos.py
+
+Options: `--db PATH` to open a specific database, `--debug` for verbose console
+output. Without `--db` the database and config sit next to the program.
 
 Or download a prebuilt binary from the
 [Releases page](https://github.com/Cyclotronic/pos/releases):
@@ -38,7 +62,7 @@ Or download a prebuilt binary from the
 Unzip the macOS download and launch the app inside.
 
 ### macOS note
-The app is not code-signed. On first launch macOS will block it — go to
+The app is not code-signed. On first launch macOS will block it - go to
 System Settings → Privacy & Security and click "Open Anyway"
 (on older macOS versions: right-click the app → Open). This is only
 needed once.

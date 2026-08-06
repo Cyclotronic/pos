@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.3.0] - 2026-08-06
+
+### Changed
+- Reworked the window on the same framework as LGI: `App` is the `tk.Tk`
+  subclass, tabs are self-contained `QueuedFrame` classes, and every worker
+  posts events to a queue the main loop drains instead of touching widgets
+- Native ttk theme (clam/vista/aqua) replaces the hard-coded Segoe UI palette,
+  so the app looks native on macOS and Linux rather than Windows-shaped
+- Grid layout on a single `PAD` unit throughout; panes give their space to the
+  table and log instead of to padding
+- Connections tab merges live serial ports, NetFinder replies and remembered
+  adapters into one sortable table; double-click connects
+- Adapter validation and connection moved off the main thread - the window no
+  longer freezes for the ~1 s probe
+- TestController integration moved from a separate `Toplevel` into a sub-tab of
+  the Database tab; its column hides when the feature is off
+- Scan address range is settable and interruptible, with a live log pane
+
+### Added
+- Menu bar (File / Scan / Tools / Help), status bar, `Ctrl+W`, `F5`
+- `--db` and `--debug` command line options, `--version`
+- Click any column heading to sort
+- Re-query *IDN?* and delete records from within a controller tab
+- Shared `QueuedFrame`, `LogPane`, `FieldDialog` and `sortable` helpers, matching
+  LGI so the two programs stay in step
+
+### Fixed
+- A partial-range scan no longer marks in-range-only addresses `NotFound`
+  outside the range that was actually walked
+- Bus access is serialised per controller, so a terminal command issued during
+  a scan can no longer interleave on the wire
+
 ## [1.2.0] - 2026-07-28
 
 ### Added
@@ -9,7 +41,7 @@
 - JSON export (Database Manager and per-adapter); Status Byte column in CSV
 
 ### Changed
-- Two-phase scan: ++spoll presence detection first, *IDN? only to responders —
+- Two-phase scan: ++spoll presence detection first, *IDN? only to responders -
   faster and safe for pre-488.2 instruments
 - Scan preconditions set automatically per session
 - Adapter validation rejects streaming serial devices (silence + consistency

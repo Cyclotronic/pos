@@ -1,45 +1,80 @@
-import os
-import shutil
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-import serial
-import serial.tools.list_ports
-import socket
-import threading
-import time
-import sqlite3
+#!/usr/bin/env python3
+"""
+POS - Prologix OpenGPIB Scanner
+
+A desktop front end for Prologix GPIB-USB and GPIB-ETHERNET controllers (and
+compatible clones such as AR488). Finds controllers on the serial bus and the
+local network, opens a tab per controller, walks the GPIB bus behind it, and
+keeps a SQLite record of every instrument it has ever seen.
+
+    python3 pos.py [--db path/to/gpib_devices.db] [--debug]
+
+Standard library plus pyserial: tkinter + sqlite3 + sockets + serial.
+"""
+
+from __future__ import annotations
+
+import argparse
 import csv
 import datetime
-import sys
 import json
+import os
+import queue
+import socket
+import sqlite3
+import sys
+import threading
+import time
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from typing import Callable, Optional
 
-__version__ = "1.2.0"
+import serial
+import serial.tools.list_ports
 
-# ================= GLOBAL CONSTANTS =================
+APP_NAME = "POS"
+APP_TITLE = "Prologix OpenGPIB Scanner"
+__version__ = VERSION = "1.3.0"
+
+PAD = 6
+MUTED = "#555555"
+OK_FG = "#0b6b2f"
+BAD_FG = "#a11111"
+
+# ==========================================================================
+# Paths and constants
+# ==========================================================================
 
 # Anchor data files to the program's own directory (script or frozen exe),
 # so the DB/config don't scatter based on the launch directory.
-if getattr(sys, 'frozen', False):
+if getattr(sys, "frozen", False):
     _APP_DIR = os.path.dirname(sys.executable)
 else:
     _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DB_NAME = os.path.join(_APP_DIR, "gpib_devices.db")
+DEFAULT_DB_PATH = os.path.join(_APP_DIR, "gpib_devices.db")
 CONFIG_FILE = os.path.join(_APP_DIR, "scanner_config.json")
+
+# Rebound by --db and by File ▸ Open database. Every database helper reads the
+# global at call time, so switching files needs no other plumbing.
+DB_NAME = DEFAULT_DB_PATH
+
 DB_TIMEOUT = 5.0  # Seconds to wait if database is locked by another thread
 PROLOGIX_TCP_PORT = 1234
 NETFINDER_UDP_PORT = 3040
 
-# Check for command line debug flag
-DEBUG_MODE = '--debug' in sys.argv
+DEBUG_MODE = "--debug" in sys.argv
 
-def dprint(*args, **kwargs):
-    """Custom print function that only outputs if --debug flag is passed."""
+
+def dprint(*args, **kwargs) -> None:
+    """Print only when --debug was passed."""
     if DEBUG_MODE:
         print(*args, **kwargs)
 
-def decode_status_byte(sb):
-    """Formats a serial-poll status byte with decoded IEEE-488 flag bits.
+
+def decode_status_byte(sb) -> str:
+    """Format a serial-poll status byte with decoded IEEE-488 flag bits.
     SRQ = device requesting service, ESB = event/error summary (488.2),
     MAV = message available (unread data in the output queue)."""
     if sb is None or sb == "":
@@ -49,43 +84,52 @@ def decode_status_byte(sb):
     except (TypeError, ValueError):
         return ""
     flags = []
-    if sb & 0x40: flags.append("SRQ")
-    if sb & 0x20: flags.append("ESB")
-    if sb & 0x10: flags.append("MAV")
+    if sb & 0x40:
+        flags.append("SRQ")
+    if sb & 0x20:
+        flags.append("ESB")
+    if sb & 0x10:
+        flags.append("MAV")
     return f"0x{sb:02X}" + (f" ({','.join(flags)})" if flags else "")
 
-# ================= CONFIGURATION SETUP =================
 
-def load_config():
-    """Loads application settings from a JSON file."""
+def now_stamp() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ==========================================================================
+# Configuration file
+# ==========================================================================
+
+def load_config() -> dict:
+    """Load application settings from a JSON file."""
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            dprint(f"Error loading config: {e}")
-    
-    # Default configuration
-    return {
-        "tc_enabled": False,
-        "tc_path": ""
-    }
+            with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception as exc:
+            dprint(f"Error loading config: {exc}")
+    return {"tc_enabled": False, "tc_path": ""}
 
-def save_config(config):
-    """Saves application settings to a JSON file."""
+
+def save_config(config: dict) -> None:
+    """Save application settings to a JSON file."""
     try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=4)
-    except Exception as e:
-        dprint(f"Error saving config: {e}")
+        with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=4)
+    except Exception as exc:
+        dprint(f"Error saving config: {exc}")
 
-# ================= DATABASE SETUP =================
 
-def init_db():
-    """Initializes the SQLite database schema and handles migrations."""
+# ==========================================================================
+# Database
+# ==========================================================================
+
+def init_db() -> None:
+    """Initialise the SQLite schema and apply migrations."""
     with sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT) as conn:
         cursor = conn.cursor()
-        cursor.execute('''
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS devices (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 adapter_type TEXT,
@@ -96,155 +140,195 @@ def init_db():
                 status TEXT,
                 last_seen TIMESTAMP
             )
-        ''')
-        
-        # Migration: Add tc_config_file column if it doesn't exist
+        """)
+        # Migration: tc_config_file
         try:
             cursor.execute("ALTER TABLE devices ADD COLUMN tc_config_file TEXT")
         except sqlite3.OperationalError:
-            pass # Column already exists
-
-        # Migration: Add status_byte column (serial poll result) if it doesn't exist
+            pass
+        # Migration: status_byte (serial poll result)
         try:
             cursor.execute("ALTER TABLE devices ADD COLUMN status_byte INTEGER")
         except sqlite3.OperationalError:
-            pass # Column already exists
-            
+            pass
         conn.commit()
 
-def upsert_devices_batch(devices_list):
-    """Inserts or updates multiple device records in a single database transaction."""
+
+def upsert_devices_batch(devices_list) -> None:
+    """Insert or update multiple device records in a single transaction."""
     if not devices_list:
         return
-
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
+    now = now_stamp()
     with sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT) as conn:
         cursor = conn.cursor()
         for dev in devices_list:
             adapter_type, port, serial_num, gpib_addr, idn_response, status, status_byte = dev
-            
-            cursor.execute('''
-                SELECT id FROM devices 
-                WHERE adapter_serial = ? AND gpib_address = ?
-            ''', (serial_num, gpib_addr))
+            cursor.execute(
+                "SELECT id FROM devices WHERE adapter_serial = ? AND gpib_address = ?",
+                (serial_num, gpib_addr))
             row = cursor.fetchone()
-            
             if row:
-                cursor.execute('''
-                    UPDATE devices 
-                    SET idn_response = ?, status = ?, last_seen = ?, adapter_type = ?, connection_port = ?, status_byte = ?
+                cursor.execute("""
+                    UPDATE devices
+                    SET idn_response = ?, status = ?, last_seen = ?, adapter_type = ?,
+                        connection_port = ?, status_byte = ?
                     WHERE id = ?
-                ''', (idn_response, status, now, adapter_type, port, status_byte, row[0]))
+                """, (idn_response, status, now, adapter_type, port, status_byte, row[0]))
             else:
-                cursor.execute('''
-                    INSERT INTO devices (adapter_type, connection_port, adapter_serial, gpib_address, idn_response, status, last_seen, status_byte)
+                cursor.execute("""
+                    INSERT INTO devices (adapter_type, connection_port, adapter_serial,
+                                         gpib_address, idn_response, status, last_seen, status_byte)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (adapter_type, port, serial_num, gpib_addr, idn_response, status, now, status_byte))
+                """, (adapter_type, port, serial_num, gpib_addr, idn_response, status,
+                      now, status_byte))
         conn.commit()
 
-def mark_missing_devices(serial_num, found_addresses):
-    """Marks previously discovered devices as 'NotFound' if they didn't answer this scan."""
+
+def mark_missing_devices(serial_num: str, found_addresses,
+                         first: int = 0, last: int = 30) -> None:
+    """Mark previously discovered devices 'NotFound' if they missed this scan.
+
+    Bounded by the address range that was actually walked: a partial scan of
+    0-10 must not declare an instrument at 22 missing when nobody asked it.
+    """
     with sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT) as conn:
         cursor = conn.cursor()
+        sql = ("UPDATE devices SET status = 'NotFound' "
+               "WHERE adapter_serial = ? AND gpib_address BETWEEN ? AND ?")
+        params = [serial_num, first, last]
         if found_addresses:
-            placeholders = ','.join('?' for _ in found_addresses)
-            query = f'''
-                UPDATE devices 
-                SET status = 'NotFound' 
-                WHERE adapter_serial = ? AND gpib_address NOT IN ({placeholders})
-            '''
-            params = [serial_num] + found_addresses
-            cursor.execute(query, params)
-        else:
-            cursor.execute("UPDATE devices SET status = 'NotFound' WHERE adapter_serial = ?", (serial_num,))
+            placeholders = ",".join("?" for _ in found_addresses)
+            sql += f" AND gpib_address NOT IN ({placeholders})"
+            params += list(found_addresses)
+        cursor.execute(sql, params)
         conn.commit()
 
-def fetch_all_devices(adapter_serial=None):
-    """Fetches devices, optionally filtered by a specific adapter serial."""
+
+def fetch_all_devices(adapter_serial: Optional[str] = None):
+    """Fetch devices, optionally filtered by adapter serial."""
+    columns = ("adapter_type, connection_port, adapter_serial, gpib_address, "
+               "idn_response, status, last_seen, tc_config_file, status_byte")
     with sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT) as conn:
         cursor = conn.cursor()
         if adapter_serial:
-            cursor.execute("SELECT adapter_type, connection_port, adapter_serial, gpib_address, idn_response, status, last_seen, tc_config_file, status_byte FROM devices WHERE adapter_serial = ?", (adapter_serial,))
+            cursor.execute(f"SELECT {columns} FROM devices WHERE adapter_serial = ? "
+                           f"ORDER BY gpib_address", (adapter_serial,))
         else:
-            cursor.execute("SELECT adapter_type, connection_port, adapter_serial, gpib_address, idn_response, status, last_seen, tc_config_file, status_byte FROM devices")
+            cursor.execute(f"SELECT {columns} FROM devices "
+                           f"ORDER BY adapter_serial, gpib_address")
         return cursor.fetchall()
 
-def delete_device_records(records):
-    """Deletes specific device records from the DB using a batch execution."""
-    if not records: 
+
+def fetch_devices_for_matching():
+    with sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, adapter_type, gpib_address, idn_response FROM devices "
+                       "ORDER BY adapter_serial, gpib_address")
+        return cursor.fetchall()
+
+
+def delete_device_records(records) -> None:
+    """Delete specific device records in a batch."""
+    if not records:
         return
     with sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT) as conn:
         cursor = conn.cursor()
-        cursor.executemany("DELETE FROM devices WHERE gpib_address = ? AND adapter_serial = ?", records)
+        cursor.executemany(
+            "DELETE FROM devices WHERE gpib_address = ? AND adapter_serial = ?", records)
         conn.commit()
 
-def batch_update_tc_configs(updates):
-    """Executes a batch update of TestController matched configs."""
-    if not updates: return
+
+def batch_update_tc_configs(updates) -> None:
+    """Batch-update TestController matched configs."""
+    if not updates:
+        return
     with sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT) as conn:
         cursor = conn.cursor()
         cursor.executemany("UPDATE devices SET tc_config_file = ? WHERE id = ?", updates)
         conn.commit()
 
-# ================= ADAPTER CLASSES =================
+
+def known_adapters():
+    """Every adapter the database has ever recorded, newest sighting first."""
+    with sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT adapter_type, connection_port, adapter_serial,
+                   COUNT(*), MAX(last_seen)
+            FROM devices
+            GROUP BY adapter_serial
+            ORDER BY MAX(last_seen) DESC
+        """)
+        return cursor.fetchall()
+
+
+# ==========================================================================
+# Transport layer
+# ==========================================================================
 
 class PrologixAdapter:
-    def __init__(self, port_or_ip, adapter_type, serial_num):
+    def __init__(self, port_or_ip: str, adapter_type: str, serial_num: str):
         self.port_or_ip = port_or_ip
         self.adapter_type = adapter_type
         self.serial_num = serial_num
-    def write(self, command): pass
-    def read(self): pass
-    def flush_input(self): pass
-    def close(self): pass
+
+    def write(self, command: str) -> None: pass
+    def read(self) -> str: return ""
+    def flush_input(self) -> None: pass
+    def close(self) -> None: pass
+
+    @property
+    def key(self) -> str:
+        return f"{self.adapter_type}:{self.port_or_ip}"
+
 
 class USBAdapter(PrologixAdapter):
-    def __init__(self, port, serial_num):
+    def __init__(self, port: str, serial_num: str):
         super().__init__(port, "USB", serial_num)
         self.ser = serial.Serial(port, baudrate=9600, timeout=0.5)
-        
-    def write(self, command):
+
+    def write(self, command: str) -> None:
         try:
-            self.ser.write((command + '\n').encode('ascii'))
-        except serial.SerialException as e:
-            dprint(f"USB Write Error: {e}")
-        
-    def read(self):
+            self.ser.write((command + "\n").encode("ascii"))
+        except serial.SerialException as exc:
+            dprint(f"USB Write Error: {exc}")
+
+    def read(self) -> str:
         try:
-            return self.ser.readline().decode('ascii').strip()
+            return self.ser.readline().decode("ascii", errors="ignore").strip()
         except serial.SerialException:
             return ""
 
-    def flush_input(self):
-        """Discards any stale/late data sitting in the receive buffer."""
+    def flush_input(self) -> None:
+        """Discard stale/late data sitting in the receive buffer."""
         try:
             self.ser.reset_input_buffer()
-        except serial.SerialException as e:
-            dprint(f"USB flush error: {e}")
-        
-    def close(self):
+        except serial.SerialException as exc:
+            dprint(f"USB flush error: {exc}")
+
+    def close(self) -> None:
         try:
             if self.ser and self.ser.is_open:
                 self.ser.close()
                 dprint(f"Closed USB port {self.port_or_ip}")
-        except Exception as e: 
-            dprint(f"Error closing USB port {self.port_or_ip}: {e}")
+        except Exception as exc:
+            dprint(f"Error closing USB port {self.port_or_ip}: {exc}")
+
 
 class EthernetAdapter(PrologixAdapter):
-    def __init__(self, ip, mac_address):
+    def __init__(self, ip: str, mac_address: str):
         super().__init__(ip, "Ethernet", mac_address)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(0.5)
         self.sock.connect((ip, PROLOGIX_TCP_PORT))
-        
-    def write(self, command):
+
+    def write(self, command: str) -> None:
         try:
-            self.sock.sendall((command + '\n').encode('ascii'))
+            self.sock.sendall((command + "\n").encode("ascii"))
         except (socket.timeout, TimeoutError, OSError):
             pass
-            
-    def read(self):
+
+    def read(self) -> str:
         try:
             data = b""
             while True:
@@ -252,15 +336,14 @@ class EthernetAdapter(PrologixAdapter):
                 if not chunk:
                     break
                 data += chunk
-                if b'\n' in data or b'\r' in data:
+                if b"\n" in data or b"\r" in data:
                     break
-            return data.decode('ascii', errors='ignore').strip()
-            
+            return data.decode("ascii", errors="ignore").strip()
         except (socket.timeout, TimeoutError, OSError):
             return ""
 
-    def flush_input(self):
-        """Discards any stale/late data sitting in the receive buffer."""
+    def flush_input(self) -> None:
+        """Discard stale/late data sitting in the receive buffer."""
         try:
             self.sock.setblocking(False)
             while True:
@@ -274,1042 +357,1792 @@ class EthernetAdapter(PrologixAdapter):
             # Restore the normal blocking timeout for subsequent reads
             self.sock.settimeout(0.5)
 
-    def close(self):
+    def close(self) -> None:
         try:
             if self.sock:
                 self.sock.close()
                 dprint(f"Closed socket for {self.port_or_ip}")
-        except Exception as e: 
-            dprint(f"Error closing socket {self.port_or_ip}: {e}")
+        except Exception as exc:
+            dprint(f"Error closing socket {self.port_or_ip}: {exc}")
 
-# ================= TESTCONTROLLER INTEGRATION =================
 
-class TestControllerIntegration(tk.Toplevel):
-    def __init__(self, parent, parent_app=None):
-        super().__init__(parent)
-        self.title("TestController Integration")
-        self.geometry("950x650")
-        self.minsize(700, 450)
-        self.parent_app = parent_app
-        
-        # Muted background
-        self.configure(bg="#f4f6f9")
-        
-        self.config = load_config()
-        self.tc_path = tk.StringVar(value=self.config.get("tc_path", ""))
-        self.integration_enabled = tk.BooleanVar(value=self.config.get("tc_enabled", False))
-        self.pending_updates = [] 
-        
-        self.build_ui()
-        self.apply_ui_state()
+# ==========================================================================
+# Headless protocol work - no widget ever appears below this line until the
+# GUI section. Everything here is callable from a worker thread or a script.
+# ==========================================================================
 
-    def build_ui(self):
-        settings_frame = ttk.LabelFrame(self, text="Integration Settings", padding=15)
-        settings_frame.pack(fill=tk.X, padx=20, pady=20)
+def list_serial_ports():
+    """[(device, description, serial_number)] for every visible serial port."""
+    out = []
+    for port in serial.tools.list_ports.comports():
+        serial_num = port.serial_number or f"Unknown_USB_{port.device}"
+        out.append((port.device, port.description or "", serial_num))
+    return out
 
-        ttk.Checkbutton(
-            settings_frame, 
-            text="Enable TestController Integration", 
-            variable=self.integration_enabled,
-            command=self.toggle_integration
-        ).grid(row=0, column=0, sticky=tk.W, columnspan=3, pady=5)
 
-        ttk.Label(settings_frame, text="TestController Path:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.path_entry = ttk.Entry(settings_frame, textvariable=self.tc_path, width=65, state='disabled')
-        self.path_entry.grid(row=1, column=1, padx=10, pady=5)
-        
-        self.browse_btn = ttk.Button(settings_frame, text="Browse...", command=self.browse_path, state='disabled')
-        self.browse_btn.grid(row=1, column=2, pady=5)
+def netfinder_discover(timeout: float = 5.0, emit: Optional[Callable[[str], None]] = None):
+    """Broadcast the Prologix NetFinder probe and collect the replies.
 
-        self.scan_btn = ttk.Button(settings_frame, text="Match Discovered Devices", command=self.match_devices, state='disabled')
-        self.scan_btn.grid(row=2, column=0, columnspan=3, pady=15)
+    Returns [(ip, mac)]. `emit` receives progress lines if supplied.
+    """
+    def say(line: str) -> None:
+        dprint(line)
+        if emit:
+            emit(line)
 
-        # Pack the action bar BEFORE the expanding list frame, anchored to the
-        # bottom. Pack allocates space in packing order, so this guarantees the
-        # buttons keep their strip; the treeview then expands into what's left
-        # and scrolls, instead of growing and pushing the buttons off-screen.
-        action_frame = ttk.Frame(self, padding=20)
-        action_frame.pack(fill=tk.X, side=tk.BOTTOM)
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(timeout)
 
-        self.accept_btn = ttk.Button(action_frame, text="Accept & Update DB", command=self.accept_matches, state='disabled')
-        self.accept_btn.pack(side=tk.RIGHT, padx=5)
-
-        self.cancel_btn = ttk.Button(action_frame, text="Ignore & Close", command=self.cancel_matches)
-        self.cancel_btn.pack(side=tk.RIGHT, padx=5)
-
-        list_frame = ttk.LabelFrame(self, text="Discovered Devices & Matching TC Configs (Preview)", padding=15)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
-
-        columns = ("ID", "Adapter", "GPIB Addr", "IDN Response", "TC Config File")
-        self.tree = ttk.Treeview(list_frame, columns=columns, show="headings")
-        
-        # Setup Zebra Striping with softer contrast
-        self.tree.tag_configure('evenrow', background='#ebedf0')
-        self.tree.tag_configure('oddrow', background='#f4f6f9')
-        
-        self.tree.heading("ID", text="ID")
-        self.tree.heading("Adapter", text="Adapter")
-        self.tree.heading("GPIB Addr", text="GPIB Addr")
-        self.tree.heading("IDN Response", text="IDN Response")
-        self.tree.heading("TC Config File", text="TC Config File")
-
-        self.tree.column("ID", width=50, anchor=tk.CENTER)
-        self.tree.column("Adapter", width=120)
-        self.tree.column("GPIB Addr", width=100, anchor=tk.CENTER)
-        self.tree.column("IDN Response", width=300)
-        self.tree.column("TC Config File", width=250)
-
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscroll=scrollbar.set)
-        
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-    def apply_ui_state(self):
-        state = 'normal' if self.integration_enabled.get() else 'disabled'
-        self.path_entry.config(state=state)
-        self.browse_btn.config(state=state)
-        self.scan_btn.config(state=state)
-        if not self.integration_enabled.get():
-            self.accept_btn.config(state='disabled')
-
-    def toggle_integration(self):
-        self.apply_ui_state()
-        self.config["tc_enabled"] = self.integration_enabled.get()
-        save_config(self.config)
-
-    def browse_path(self):
-        directory = filedialog.askdirectory(parent=self, title="Select TestController Installation Directory")
-        if directory:
-            if not os.path.isdir(directory):
-                messagebox.showerror("Validation Error", "The selected path is not a valid directory.", parent=self)
-                return
-
-            has_jar = any(f.lower() == "testcontroller.jar" for f in os.listdir(directory))
-            has_devices = os.path.isdir(os.path.join(directory, "Devices")) or os.path.isdir(os.path.join(directory, "devices"))
-
-            if has_jar and has_devices:
-                self.tc_path.set(directory)
-                self.config["tc_path"] = directory
-                save_config(self.config)
-            else:
-                err_msg = "Selected directory is missing required files:\n\n"
-                if not has_jar: err_msg += "- TestController.jar not found\n"
-                if not has_devices: err_msg += "- 'Devices' folder not found"
-                messagebox.showerror("Validation Error", err_msg, parent=self)
-
-    def get_tc_devices_path(self):
-        base_path = self.tc_path.get()
-        if not base_path:
-            return None
-        for folder_name in ["Devices", "devices"]:
-            dev_path = os.path.join(base_path, folder_name)
-            if os.path.isdir(dev_path):
-                return dev_path
-        return None
-
-    def match_devices(self):
-        dev_path = self.get_tc_devices_path()
-        if not dev_path:
-            messagebox.showerror("Error", "Could not find 'Devices' folder in the selected TestController path.", parent=self)
-            return
-
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-
-        tc_configs = {}
-        for filename in os.listdir(dev_path):
-            if filename.endswith(".txt"):
-                filepath = os.path.join(dev_path, filename)
-                tc_configs[filename] = [] 
-                try:
-                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                        for line in f:
-                            line_stripped = line.strip()
-                            if line_stripped.lower().startswith("#idstring"):
-                                id_string = line_stripped[9:].strip().strip(",")
-                                tc_configs[filename].append(id_string)
-                except Exception:
-                    continue
+        discovery_packet = bytes.fromhex("5A 00 5A 9E FF FF FF FF FF FF 00 00")
 
         try:
-            with sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT id, adapter_type, gpib_address, idn_response FROM devices")
-                devices = cursor.fetchall()
-            
-            self.pending_updates = []
-            for i, dev in enumerate(devices):
-                dev_id, adapter, gpib, idn = dev
-                idn = idn if idn else "Unknown"
-                matched_file = "Not Found"
-                
-                for filename, id_strings in tc_configs.items():
-                    file_matched = False
-                    for id_string in id_strings:
-                        id_parts = [part.strip().lower() for part in id_string.split(",") if part.strip()]
-                        idn_lower = idn.lower()
-                        if id_parts and all(part in idn_lower for part in id_parts):
-                            matched_file = filename
-                            file_matched = True
-                            break
-                    if file_matched: break 
+            sock.sendto(discovery_packet, ("255.255.255.255", NETFINDER_UDP_PORT))
+            say("Probe sent to 255.255.255.255")
+        except OSError as exc:
+            say(f"Global broadcast refused: {exc}")
 
-                self.pending_updates.append((matched_file if matched_file != "Not Found" else None, dev_id))
-                
-                # Apply Zebra Striping tags
-                tag = 'evenrow' if i % 2 == 0 else 'oddrow'
-                self.tree.insert("", tk.END, values=(dev_id, adapter, gpib, idn, matched_file), tags=(tag,))
-            
-            if self.pending_updates:
-                self.accept_btn.config(state='normal')
-                messagebox.showinfo("Scan Complete", "Devices matched. Please review the list and click 'Accept & Update DB' to save changes.", parent=self)
-            else:
-                messagebox.showinfo("Scan Complete", "No devices found in the database to match.", parent=self)
-            
-        except sqlite3.Error as e:
-            messagebox.showerror("Database Error", str(e), parent=self)
-
-    def accept_matches(self):
-        if self.pending_updates:
-            batch_update_tc_configs(self.pending_updates)
-            if self.parent_app:
-                self.parent_app.refresh_db_view()
-            messagebox.showinfo("Success", "Database updated successfully with matched configuration files.", parent=self)
-        self.destroy()
-
-    def cancel_matches(self):
-        self.destroy()
-
-
-# ================= MAIN GUI APPLICATION =================
-
-class PrologixMultiScannerApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Prologix OpenGPIB Scanner")
-        self.root.geometry("1150x800") 
-        
-        self.apply_modern_flat_styling()
-        
-        self.active_adapters = []
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
-        self.usb_serials = {}
-        self.eth_macs = {}
-        
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        init_db()
-        self.setup_connection_tab()
-        self.setup_db_manager_tab()
-        self.scan_com_ports()
-
-    def apply_modern_flat_styling(self):
-        """Applies a clean, modern Flat UI aesthetic with muted, low-contrast colors."""
-        self.style = ttk.Style(self.root)
-        
-        if 'clam' in self.style.theme_names():
-            self.style.theme_use('clam')
-            
-        # --- Lower-Contrast Color Palette ---
-        bg_color = "#f4f6f9"         # Muted off-white background
-        surface_color = "#e2e6ea"    # Soft grey for headers/stripes
-        border_color = "#cbd3da"     # Muted grey for borders
-        primary = "#5b7c99"          # Muted slate/steel blue
-        primary_hover = "#4a6882"    # Darker slate for active states
-        text_dark = "#343a40"        # Softer dark-gray text (less harsh than black)
-        
-        self.root.configure(bg=bg_color)
-        
-        app_font = ("Segoe UI", 11)
-        bold_font = ("Segoe UI", 11, "bold")
-        title_font = ("Segoe UI", 12, "bold")
-        
-        # Base configuration
-        self.style.configure(".", font=app_font, background=bg_color, foreground=text_dark)
-        
-        # Notebook & Tabs
-        self.style.configure("TNotebook", background=bg_color, borderwidth=0)
-        self.style.configure("TNotebook.Tab", font=bold_font, padding=[20, 10], 
-                             background=surface_color, borderwidth=1, bordercolor=border_color, 
-                             foreground="#6c757d")
-        self.style.map("TNotebook.Tab", 
-                       background=[("selected", primary)], 
-                       foreground=[("selected", "#ffffff")])
-                       
-        # Containers (LabelFrames)
-        self.style.configure("TLabelframe", background=bg_color, borderwidth=1, bordercolor=border_color, relief="solid")
-        self.style.configure("TLabelframe.Label", font=title_font, background=bg_color, foreground=primary, padding=[10, 0])
-        
-        # Flat Action Buttons
-        self.style.configure("TButton", font=bold_font, padding=[12, 8], 
-                             background=primary, foreground="white", 
-                             lightcolor=primary, darkcolor=primary, bordercolor=primary_hover, borderwidth=1)
-        self.style.map("TButton", 
-                       background=[("active", primary_hover), ("disabled", "#d1d5db")],
-                       lightcolor=[("active", primary_hover), ("disabled", "#d1d5db")],
-                       darkcolor=[("active", primary_hover), ("disabled", "#d1d5db")],
-                       bordercolor=[("active", primary_hover), ("disabled", border_color)],
-                       foreground=[("disabled", "#8a949e")])
-                       
-        # Treeview (Data Tables)
-        self.style.configure("Treeview", font=app_font, rowheight=35, borderwidth=1, bordercolor=border_color)
-        self.style.configure("Treeview.Heading", font=bold_font, background=surface_color, foreground=text_dark, padding=8, borderwidth=1, bordercolor=border_color)
-        self.style.map("Treeview", background=[("selected", primary)], foreground=[("selected", "white")])
-        
-        # Inputs
-        self.style.configure("TCombobox", padding=6)
-        self.style.configure("TEntry", padding=6)
-
-    def on_closing(self):
-        dprint("Shutting down... releasing resources.")
-        for adapter in self.active_adapters:
-            adapter.close()
-        self.root.destroy()
-
-    def setup_connection_tab(self):
-        conn_frame = ttk.Frame(self.notebook)
-        self.notebook.add(conn_frame, text="Connections Manager")
-        
-        lbl_frame = ttk.LabelFrame(conn_frame, text="1. Discover & Connect", padding=20)
-        lbl_frame.pack(fill="x", padx=20, pady=20)
-
-        # USB
-        ttk.Label(lbl_frame, text="USB COM Ports:").grid(row=0, column=0, padx=10, pady=15, sticky="e")
-        self.com_combo = ttk.Combobox(lbl_frame, state="readonly", width=45)
-        self.com_combo.grid(row=0, column=1, padx=10, pady=15)
-        
-        ttk.Button(lbl_frame, text="Refresh Ports", command=self.scan_com_ports).grid(row=0, column=2, padx=10, pady=15)
-        ttk.Button(lbl_frame, text="Connect & Create Tab", command=self.connect_usb).grid(row=0, column=3, padx=10, pady=15)
-
-        # Ethernet
-        ttk.Label(lbl_frame, text="Ethernet IP:").grid(row=1, column=0, padx=10, pady=15, sticky="e")
-        self.eth_combo = ttk.Combobox(lbl_frame, width=45)
-        self.eth_combo.grid(row=1, column=1, padx=10, pady=15)
-        
-        self.btn_discover_eth = ttk.Button(lbl_frame, text="Discover (NetFinder)", command=self.start_netfinder_discovery)
-        self.btn_discover_eth.grid(row=1, column=2, padx=10, pady=15)
-        self.btn_connect_eth = ttk.Button(lbl_frame, text="Connect & Create Tab", command=self.connect_eth)
-        self.btn_connect_eth.grid(row=1, column=3, padx=10, pady=15)
-
-    def setup_db_manager_tab(self):
-        self.db_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.db_frame, text="Database Manager")
-        
-        btn_frame = ttk.Frame(self.db_frame, padding=10)
-        btn_frame.pack(fill="x", padx=10, pady=10)
-        
-        ttk.Button(btn_frame, text="Refresh View", command=self.refresh_db_view).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="Export All to CSV", command=lambda: self.export_csv(None)).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="Export All to JSON", command=lambda: self.export_json(None)).pack(side="left", padx=5)
-        
-        # Updated to reflect multi-select functionality
-        ttk.Button(btn_frame, text="Delete Selected Record(s)", command=self.delete_db_record).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="TestController Integration", command=self.open_tc_integration).pack(side="left", padx=5)
-        
-        columns = ("Type", "Port/IP", "Adapter Serial", "GPIB", "IDN Response", "Status", "Last Seen", "TC Config", "SPoll")
-        self.db_tree = ttk.Treeview(self.db_frame, columns=columns, show="headings")
-        
-        # Apply softer Zebra Striping Tags
-        self.db_tree.tag_configure('evenrow', background='#ebedf0')
-        self.db_tree.tag_configure('oddrow', background='#f4f6f9')
-        
-        for col in columns:
-            self.db_tree.heading(col, text=col)
-            self.db_tree.column(col, width=120)
-            
-        self.db_tree.column("IDN Response", width=250)
-        self.db_tree.column("TC Config", width=200)
-        self.db_tree.column("GPIB", width=60, anchor="center")
-        self.db_tree.column("SPoll", width=110, anchor="center")
-        self.db_tree.pack(fill="both", expand=True, padx=20, pady=10)
-        
-        self.refresh_db_view()
-
-    def open_tc_integration(self):
-        TestControllerIntegration(self.root, parent_app=self)
-
-    def refresh_db_view(self):
-        for item in self.db_tree.get_children():
-            self.db_tree.delete(item)
-        rows = fetch_all_devices()
-        for i, row in enumerate(rows):
-            tag = 'evenrow' if i % 2 == 0 else 'oddrow'
-            display = list(row[:8]) + [decode_status_byte(row[8])]
-            self.db_tree.insert("", tk.END, values=display, tags=(tag,))
-
-    def delete_db_record(self):
-        """Allows deletion of one or multiple selected records from the database view."""
-        selected_items = self.db_tree.selection()
-        
-        if not selected_items:
-            messagebox.showwarning("Warning", "Please select at least one record to delete.")
-            return
-            
-        count = len(selected_items)
-        prompt_msg = f"Are you sure you want to delete the {count} selected record{'s' if count > 1 else ''}?"
-        
-        if messagebox.askyesno("Confirm Delete", prompt_msg):
-            records_to_delete = []
-            for item_id in selected_items:
-                values = self.db_tree.item(item_id)['values']
-                # values[3] is GPIB Address, values[2] is Adapter Serial
-                records_to_delete.append((values[3], values[2]))
-                
-            delete_device_records(records_to_delete)
-            self.refresh_db_view()
-
-    # --- Discovery Methods ---
-
-    def scan_com_ports(self):
-        ports = serial.tools.list_ports.comports()
-        port_list = []
-        self.usb_serials.clear()
-        
-        for port in ports:
-            desc = f"{port.device} - {port.description}"
-            port_list.append(desc)
-            serial_num = port.serial_number if port.serial_number else f"Unknown_USB_{port.device}"
-            self.usb_serials[port.device] = serial_num
-            
-        self.com_combo['values'] = port_list
-        if port_list:
-            self.com_combo.current(0)
-        else:
-            self.com_combo.set("No COM ports found")
-
-    def start_netfinder_discovery(self):
-        self.eth_combo.set("Discovering... (Wait 5s)")
-        self.btn_discover_eth.config(state="disabled")
-        self.btn_connect_eth.config(state="disabled")
-        threading.Thread(target=self.udp_discover_thread, daemon=True).start()
-
-    def udp_discover_thread(self):
-        dprint("\n--- STARTING NETFINDER UDP DISCOVERY ---")
-        discovered_options = []
-        sock = None
+        # Some stacks drop the all-ones broadcast; repeat per interface subnet.
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            sock.settimeout(5.0)
-            
-            discovery_packet = bytes.fromhex("5A 00 5A 9E FF FF FF FF FF FF 00 00")
-            
-            try: sock.sendto(discovery_packet, ('255.255.255.255', NETFINDER_UDP_PORT))
-            except OSError: pass
-            
+            _, _, ips = socket.gethostbyname_ex(socket.gethostname())
+            for ip in ips:
+                parts = ip.split(".")
+                if len(parts) == 4:
+                    subnet_bcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+                    try:
+                        sock.sendto(discovery_packet, (subnet_bcast, NETFINDER_UDP_PORT))
+                        say(f"Probe sent to {subnet_bcast}")
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+        while True:
             try:
-                hostname = socket.gethostname()
-                _, _, ips = socket.gethostbyname_ex(hostname)
-                for ip in ips:
-                    parts = ip.split('.')
-                    if len(parts) == 4:
-                        subnet_bcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
-                        try: sock.sendto(discovery_packet, (subnet_bcast, NETFINDER_UDP_PORT))
-                        except OSError: pass
-            except OSError: pass
+                data, _addr = sock.recvfrom(1024)
+                if len(data) >= 24 and data.startswith(b"\x5a\x01\x5a\x9e"):
+                    mac_str = ":".join(f"{b:02X}" for b in data[4:10])
+                    ip_str = socket.inet_ntoa(data[20:24])
+                    if ip_str not in seen:
+                        seen.add(ip_str)
+                        found.append((ip_str, mac_str))
+                        say(f"Reply from {ip_str} (MAC {mac_str})")
+            except socket.timeout:
+                break
+            except OSError:
+                break
+    finally:
+        if sock is not None:
+            sock.close()
+    say(f"Discovery finished: {len(found)} adapter(s).")
+    return found
 
-            while True:
-                try:
-                    data, addr = sock.recvfrom(1024)
-                    if len(data) >= 24 and data.startswith(b"\x5a\x01\x5a\x9e"):
-                        mac_bytes = data[4:10]
-                        mac_str = ':'.join(f'{b:02X}' for b in mac_bytes)
-                        ip_bytes = data[20:24]
-                        ip_str = socket.inet_ntoa(ip_bytes)
-                        
-                        self.eth_macs[ip_str] = mac_str
-                        display_str = f"{ip_str} (MAC: {mac_str})"
-                        
-                        if display_str not in discovered_options:
-                            discovered_options.append(display_str)
-                except socket.timeout: break 
-                except OSError: break
-        finally:
-            if sock is not None:
-                sock.close()
-            
-        if self.root.winfo_exists():
-            self.root.after(0, lambda: self.finish_netfinder_discovery(discovered_options))
 
-    def finish_netfinder_discovery(self, options):
-        self.btn_discover_eth.config(state="normal")
-        self.btn_connect_eth.config(state="normal")
-        if options:
-            self.eth_combo['values'] = options
-            self.eth_combo.current(0)
-            messagebox.showinfo("NetFinder", f"Found {len(options)} adapter(s).")
-        else:
-            self.eth_combo['values'] = []
-            self.eth_combo.set("No Prologix adapters found.")
+def probe_controller(adapter: PrologixAdapter, location_desc: str):
+    """Decide whether `adapter` really is a Prologix-compatible controller.
 
-    # --- Connection & Tab Creation Methods ---
+    Returns (verdict, message) where verdict is "ok", "ask" or "reject". No
+    dialogs are raised here so the check can run on a worker thread; the caller
+    turns "ask" into a prompt on the main thread.
 
-    def validate_adapter(self, adapter, location_desc):
-        """Validates a controller via ++ver. Returns True to keep it, False to close it.
+    A Prologix-compatible controller has two testable properties:
+      1. It is SILENT unless queried (a streaming device fails this), and
+      2. It answers the same query with the same response every time
+         (a streaming device's 'responses' are just whatever data happened
+         to be in flight, so they differ between queries).
+    """
+    # Let the device settle after port-open (some controllers, e.g.
+    # Arduino-based AR488, reset on open and emit boot text), then discard
+    # anything that arrived unprompted so far.
+    time.sleep(0.3)
+    adapter.flush_input()
 
-        A Prologix-compatible controller has two testable properties:
-          1. It is SILENT unless queried (a streaming device fails this), and
-          2. It answers the same query with the same response every time
-             (a streaming device's 'responses' are just whatever data happened
-             to be in flight, so they differ between queries).
-        Genuine Prologix is accepted immediately; a consistent non-Prologix
-        responder (e.g. AR488) gets a connect-anyway prompt."""
+    # Check 1: silence. Read with NO command sent.
+    unsolicited = (adapter.read() or "").strip()
+    if unsolicited:
+        return "reject", (
+            f"The device at {location_desc} is transmitting data without being "
+            f"queried:\n\n'{unsolicited[:120]}'\n\n"
+            f"A Prologix-compatible controller only responds to commands. "
+            f"This looks like a different kind of serial device.")
 
-        # Let the device settle after port-open (some controllers, e.g.
-        # Arduino-based AR488, reset on open and emit boot text), then
-        # discard anything that arrived unprompted so far.
-        time.sleep(0.3)
+    # Check 2: consistent answers to ++ver, queried twice.
+    responses = []
+    for _ in range(2):
         adapter.flush_input()
+        adapter.write("++ver")
+        time.sleep(0.2)
+        responses.append((adapter.read() or "").strip())
+    r1, r2 = responses
 
-        # --- Check 1: Silence. Read with NO command sent. A controller
-        # returns nothing; a streaming device produces data anyway.
-        unsolicited = adapter.read().strip()
-        if unsolicited:
-            messagebox.showerror(
-                "Hardware Validation Failed",
-                f"The device at {location_desc} is transmitting data without "
-                f"being queried:\n\n'{unsolicited[:120]}'\n\n"
-                f"A Prologix-compatible controller only responds to commands. "
-                f"This looks like a different kind of serial device."
-            )
-            return False
+    if not r1 and not r2:
+        return "reject", (
+            f"The device at {location_desc} did not respond to ++ver at all.\n"
+            f"It does not appear to be a Prologix-compatible controller.")
 
-        # --- Check 2: Consistent answers to ++ver, queried twice.
-        responses = []
-        for _ in range(2):
-            adapter.flush_input()
-            adapter.write("++ver")
-            time.sleep(0.2)
-            responses.append(adapter.read().strip())
-        r1, r2 = responses
+    if r1 != r2:
+        return "reject", (
+            f"The device at {location_desc} gave inconsistent responses to the "
+            f"same ++ver query:\n\n'{r1[:80]}'\n'{r2[:80]}'\n\n"
+            f"A controller answers identically each time; this looks like a "
+            f"device streaming unrelated data.")
 
-        if not r1 and not r2:
-            messagebox.showerror(
-                "Hardware Validation Failed",
-                f"The device at {location_desc} did not respond to ++ver at all.\n"
-                f"It does not appear to be a Prologix-compatible controller."
-            )
-            return False
+    if "Prologix" in r1:
+        return "ok", r1
 
-        if r1 != r2:
-            messagebox.showerror(
-                "Hardware Validation Failed",
-                f"The device at {location_desc} gave inconsistent responses to "
-                f"the same ++ver query:\n\n'{r1[:80]}'\n'{r2[:80]}'\n\n"
-                f"A controller answers identically each time; this looks like "
-                f"a device streaming unrelated data."
-            )
-            return False
+    # Consistent, non-empty, non-Prologix: likely a compatible clone.
+    return "ask", (
+        f"The device at {location_desc} responded consistently to ++ver but did "
+        f"not identify as Prologix:\n\n'{r1}'\n\n"
+        f"This may be a compatible controller (e.g. AR488). Connect anyway?")
 
-        if "Prologix" in r1:
-            return True
 
-        # Consistent, non-empty, non-Prologix: likely a compatible clone.
-        return messagebox.askyesno(
-            "Unrecognized Controller",
-            f"The device at {location_desc} responded consistently to ++ver "
-            f"but did not identify as Prologix:\n\n'{r1}'\n\n"
-            f"This may be a compatible controller (e.g. AR488). Connect anyway?"
-        )
+SCAN_PRECONDITIONS = ("++mode 1", "++auto 0", "++eos 3", "++eoi 1", "++read_tmo_ms 200")
 
-    def connect_usb(self):
-        selection = self.com_combo.get()
-        if not selection or "No COM ports" in selection:
-            messagebox.showerror("Error", "Please select a valid COM port.")
-            return
-        port = selection.split(" - ")[0]
-        serial_num = self.usb_serials.get(port, f"Unknown_{port}")
-        
+
+def scan_bus(adapter: PrologixAdapter, first: int = 0, last: int = 30,
+             stop_event: Optional[threading.Event] = None,
+             emit: Optional[Callable[..., None]] = None):
+    """Two-phase bus walk: serial-poll every address, then *IDN? the responders.
+
+    Returns (records, present_addresses). `emit(kind, *args)` is called with
+    ("log", text), ("progress", done, total) and ("row", record) as it goes.
+    """
+    def send(kind: str, *args) -> None:
+        if emit:
+            emit(kind, *args)
+
+    stop_event = stop_event or threading.Event()
+
+    # Enforce scan preconditions (session-only; deliberately no ++savecfg).
+    # ++read_tmo_ms MUST be shorter than the 0.5 s transport read timeout,
+    # otherwise late replies arrive in the NEXT iteration's read and cause
+    # phantom/duplicated devices at the wrong addresses.
+    for cmd in SCAN_PRECONDITIONS:
+        adapter.write(cmd)
+    time.sleep(0.2)
+    adapter.flush_input()
+    send("log", "Session set to Controller / Auto off / EOS none / EOI on / 200 ms "
+                "(not saved to EEPROM).")
+
+    addresses = list(range(first, last + 1))
+    total = len(addresses)
+
+    # Phase 1: fast presence detection via serial poll (IEEE-488.1). Every GPIB
+    # device answers spoll at the interface-chip level, so this is safe for
+    # pre-488.2 instruments and much faster on empty addresses. A valid spoll
+    # reply is a decimal status byte (0-255); anything else is stale data or an
+    # error string and is NOT treated as presence.
+    present: list[int] = []
+    status_bytes: dict[int, int] = {}
+    for done, addr in enumerate(addresses, start=1):
+        if stop_event.is_set():
+            send("log", "Stopped during serial poll.")
+            return [], present
+        adapter.flush_input()
+        adapter.write(f"++spoll {addr}")
+        response = (adapter.read() or "").strip()
+        dprint(f"spoll {addr}: '{response}'")
+        if response.isdigit() and 0 <= int(response) <= 255:
+            present.append(addr)
+            status_bytes[addr] = int(response)
+            send("log", f"  {addr:>2}  present, status byte {decode_status_byte(int(response))}")
+        send("progress", done, total)
+
+    send("log", f"Serial poll complete: {len(present)} of {total} addresses answered.")
+
+    # Phase 2: identify only the devices that answered the poll.
+    records = []
+    for addr in present:
+        if stop_event.is_set():
+            send("log", "Stopped before identification finished.")
+            break
+        adapter.flush_input()
+        adapter.write(f"++addr {addr}")
+        adapter.write("*IDN?")
+        adapter.write("++read eoi")
+        response = (adapter.read() or "").strip()
+        dprint(f"*IDN? {addr}: '{response}'")
+        idn = response or "(present, no *IDN? response - pre-488.2 device)"
+        record = (adapter.adapter_type, adapter.port_or_ip, adapter.serial_num,
+                  addr, idn, "Found", status_bytes.get(addr))
+        records.append(record)
+        send("log", f"  {addr:>2}  {idn}")
+        send("row", record)
+
+    return records, present
+
+
+# ==========================================================================
+# TestController device-definition matching
+# ==========================================================================
+
+def tc_devices_path(base_path: str) -> Optional[str]:
+    """The Devices folder inside a TestController install, or None."""
+    if not base_path:
+        return None
+    for folder_name in ("Devices", "devices"):
+        dev_path = os.path.join(base_path, folder_name)
+        if os.path.isdir(dev_path):
+            return dev_path
+    return None
+
+
+def tc_validate_install(directory: str):
+    """(ok, problem) for a candidate TestController directory."""
+    if not os.path.isdir(directory):
+        return False, "The selected path is not a valid directory."
+    has_jar = any(f.lower() == "testcontroller.jar" for f in os.listdir(directory))
+    has_devices = tc_devices_path(directory) is not None
+    if has_jar and has_devices:
+        return True, ""
+    problems = ["Selected directory is missing required files:\n"]
+    if not has_jar:
+        problems.append("- TestController.jar not found")
+    if not has_devices:
+        problems.append("- 'Devices' folder not found")
+    return False, "\n".join(problems)
+
+
+def tc_read_definitions(dev_path: str) -> dict:
+    """{filename: [idString, ...]} for every definition file in the folder."""
+    configs: dict[str, list[str]] = {}
+    for filename in sorted(os.listdir(dev_path)):
+        if not filename.endswith(".txt"):
+            continue
+        configs[filename] = []
         try:
-            adapter = USBAdapter(port, serial_num)
+            with open(os.path.join(dev_path, filename), "r",
+                      encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    stripped = line.strip()
+                    if stripped.lower().startswith("#idstring"):
+                        configs[filename].append(stripped[9:].strip().strip(","))
+        except OSError:
+            continue
+    return configs
 
-            if not self.validate_adapter(adapter, port):
-                adapter.close()
-                return
 
-            self.active_adapters.append(adapter)
-            self.create_adapter_tab(adapter)
-            
-        except Exception as e:
-            messagebox.showerror("Connection Error", str(e))
+def tc_match(idn: str, configs: dict) -> Optional[str]:
+    """First definition file whose #idString fields all appear in `idn`."""
+    idn_lower = (idn or "").lower()
+    for filename, id_strings in configs.items():
+        for id_string in id_strings:
+            parts = [p.strip().lower() for p in id_string.split(",") if p.strip()]
+            if parts and all(p in idn_lower for p in parts):
+                return filename
+    return None
 
-    def connect_eth(self):
-        selection = self.eth_combo.get().strip()
-        if not selection or "Discovering" in selection or "No Prologix" in selection:
-            messagebox.showerror("Error", "Please enter or select a valid IP address.")
+
+# ==========================================================================
+# Small shared helpers
+# ==========================================================================
+
+class QueuedFrame(ttk.Frame):
+    """A frame whose background workers post events to a queue that the Tk
+    main loop drains. Workers never touch a widget directly."""
+
+    def __init__(self, master, **kw):
+        super().__init__(master, **kw)
+        self.q: queue.Queue = queue.Queue()
+        self._pump_id: Optional[str] = None
+        self._alive = True
+        self._pump()
+
+    def _pump(self) -> None:
+        if not self._alive:
             return
-        ip = selection.split(" ")[0]
-        mac_addr = self.eth_macs.get(ip, f"Manual_{ip}")
-        
         try:
-            adapter = EthernetAdapter(ip, mac_addr)
+            while True:
+                event = self.q.get_nowait()
+                try:
+                    self.on_event(*event)
+                except Exception as exc:            # a bad event must not stop the pump
+                    print(f"event error: {exc}")
+        except queue.Empty:
+            pass
+        self._pump_id = self.after(80, self._pump)
 
-            if not self.validate_adapter(adapter, ip):
-                adapter.close()
-                return
+    def on_event(self, kind: str, *args) -> None:
+        raise NotImplementedError
 
-            self.active_adapters.append(adapter)
-            self.create_adapter_tab(adapter)
-            
-        except Exception as e:
-            messagebox.showerror("Connection Error", f"Failed to connect to {ip}:{PROLOGIX_TCP_PORT}\n{str(e)}")
-
-    def create_adapter_tab(self, adapter):
-        tab_name = f"{adapter.adapter_type}: {adapter.port_or_ip}"
-        tab_frame = ttk.Frame(self.notebook)
-        self.notebook.add(tab_frame, text=tab_name)
-        self.notebook.select(tab_frame)
-        
-        header = ttk.Frame(tab_frame)
-        header.pack(fill="x", padx=15, pady=15)
-        ttk.Label(header, text=f"Type: {adapter.adapter_type}   |   Address: {adapter.port_or_ip}   |   ID: {adapter.serial_num}", font=("Segoe UI", 12, "bold"), foreground="#5b7c99").pack(side="left")
-
-        inner_notebook = ttk.Notebook(tab_frame)
-        inner_notebook.pack(fill="both", expand=True, padx=10, pady=10)
-
-        scan_frame = ttk.Frame(inner_notebook)
-        config_frame = ttk.Frame(inner_notebook)
-        term_frame = ttk.Frame(inner_notebook)
-        inner_notebook.add(scan_frame, text="Device Scanner")
-        inner_notebook.add(config_frame, text="Adapter Configuration (Optional)")
-        inner_notebook.add(term_frame, text="Terminal")
-        self.build_terminal_tab(term_frame, adapter)
-
-        # ================= SCANNER UI =================
-        ttk.Label(scan_frame, text="Note: The scan automatically sets Mode: Controller, Auto: Disable, EOS: None, EOI: Enable for the session (not saved to EEPROM).", foreground="#5b7c99").pack(pady=10)
-        
-        ctrl_frame = ttk.Frame(scan_frame)
-        ctrl_frame.pack(fill="x", padx=20, pady=10)
-        
-        btn_scan = ttk.Button(ctrl_frame, text="Scan GPIB Bus")
-        btn_scan.pack(side="left", padx=5)
-        
-        ttk.Button(ctrl_frame, text="Export CSV", command=lambda a=adapter: self.export_csv(a.serial_num)).pack(side="left", padx=5)
-        ttk.Button(ctrl_frame, text="Export JSON", command=lambda a=adapter: self.export_json(a.serial_num)).pack(side="left", padx=5)
-        progress = ttk.Progressbar(ctrl_frame, orient="horizontal", length=400, mode="determinate")
-        progress.pack(side="left", padx=25, pady=5)
-        
-        columns = ("Type", "Port", "Serial", "GPIB", "IDN Response", "Status", "Last Seen", "SPoll")
-        tree = ttk.Treeview(scan_frame, columns=columns, show="headings")
-        
-        # Setup Zebra Striping
-        tree.tag_configure('evenrow', background='#ebedf0')
-        tree.tag_configure('oddrow', background='#f4f6f9')
-        
-        for col in columns: tree.heading(col, text=col); tree.column(col, width=120)
-        tree.column("IDN Response", width=250); tree.column("GPIB", width=60, anchor="center")
-        tree.column("SPoll", width=110, anchor="center")
-        tree.pack(fill="both", expand=True, padx=20, pady=10)
-        
-        self.populate_adapter_tree(tree, adapter.serial_num)
-
-        # ================= CONFIGURATION UI =================
-        grp1 = ttk.LabelFrame(config_frame, text="Operating Mode & General", padding=15)
-        grp1.pack(fill="x", padx=20, pady=10)
-        
-        ttk.Label(grp1, text="Mode (++mode):").grid(row=0, column=0, padx=10, pady=8, sticky="e")
-        cb_mode = ttk.Combobox(grp1, values=["0 (Device)", "1 (Controller)"], state="readonly", width=18)
-        cb_mode.grid(row=0, column=1, padx=10, pady=8, sticky="w")
-        
-        ttk.Label(grp1, text="Read-After-Write (++auto):").grid(row=0, column=2, padx=10, pady=8, sticky="e")
-        cb_auto = ttk.Combobox(grp1, values=["0 (Disable)", "1 (Enable)"], state="readonly", width=18)
-        cb_auto.grid(row=0, column=3, padx=10, pady=8, sticky="w")
-        
-        ttk.Label(grp1, text="Listen-Only (++lon):").grid(row=1, column=0, padx=10, pady=8, sticky="e")
-        cb_lon = ttk.Combobox(grp1, values=["0 (Disable)", "1 (Enable)"], state="readonly", width=18)
-        cb_lon.grid(row=1, column=1, padx=10, pady=8, sticky="w")
-        
-        ttk.Label(grp1, text="Save Config (++savecfg):").grid(row=1, column=2, padx=10, pady=8, sticky="e")
-        cb_savecfg = ttk.Combobox(grp1, values=["0 (Disable)", "1 (Enable)"], state="readonly", width=18)
-        cb_savecfg.grid(row=1, column=3, padx=10, pady=8, sticky="w")
-
-        grp2 = ttk.LabelFrame(config_frame, text="Formatting & Timeouts", padding=15)
-        grp2.pack(fill="x", padx=20, pady=10)
-        
-        ttk.Label(grp2, text="Terminator (++eos):").grid(row=0, column=0, padx=10, pady=8, sticky="e")
-        cb_eos = ttk.Combobox(grp2, values=["0 (CR+LF)", "1 (CR)", "2 (LF)", "3 (None)"], state="readonly", width=18)
-        cb_eos.grid(row=0, column=1, padx=10, pady=8, sticky="w")
-        
-        ttk.Label(grp2, text="Assert EOI (++eoi):").grid(row=0, column=2, padx=10, pady=8, sticky="e")
-        cb_eoi = ttk.Combobox(grp2, values=["0 (Disable)", "1 (Enable)"], state="readonly", width=18)
-        cb_eoi.grid(row=0, column=3, padx=10, pady=8, sticky="w")
-        
-        ttk.Label(grp2, text="Timeout ms (++read_tmo_ms):").grid(row=1, column=0, padx=10, pady=8, sticky="e")
-        ent_tmo = ttk.Entry(grp2, width=21)
-        ent_tmo.grid(row=1, column=1, padx=10, pady=8, sticky="w")
-        
-        ttk.Label(grp2, text="EOT Enable (++eot_enable):").grid(row=2, column=0, padx=10, pady=8, sticky="e")
-        cb_eoten = ttk.Combobox(grp2, values=["0 (Disable)", "1 (Enable)"], state="readonly", width=18)
-        cb_eoten.grid(row=2, column=1, padx=10, pady=8, sticky="w")
-        
-        ttk.Label(grp2, text="EOT Char (++eot_char):").grid(row=2, column=2, padx=10, pady=8, sticky="e")
-        ent_eotchar = ttk.Entry(grp2, width=21)
-        ent_eotchar.grid(row=2, column=3, padx=10, pady=8, sticky="w")
-
-        grp3 = ttk.LabelFrame(config_frame, text="Advanced Actions (Immediate)", padding=15)
-        grp3.pack(fill="x", padx=20, pady=10)
-        ttk.Button(grp3, text="Interface Clear (++ifc)", command=lambda a=adapter: self.run_action_cmd(a, "++ifc", "Interface Clear Sent")).grid(row=0, column=0, padx=10, pady=5)
-        ttk.Button(grp3, text="Device Clear (++clr)", command=lambda a=adapter: self.run_action_cmd(a, "++clr", "Device Clear Sent")).grid(row=0, column=1, padx=10, pady=5)
-        ttk.Button(grp3, text="Local Lockout (++llo)", command=lambda a=adapter: self.run_action_cmd(a, "++llo", "Local Lockout Sent")).grid(row=0, column=2, padx=10, pady=5)
-        ttk.Button(grp3, text="Go to Local (++loc)", command=lambda a=adapter: self.run_action_cmd(a, "++loc", "Go to Local Sent")).grid(row=0, column=3, padx=10, pady=5)
-
-        grp_ctrl = ttk.Frame(config_frame, padding=10)
-        grp_ctrl.pack(fill="x", padx=10, pady=15)
-
-        lbl_cfg_status = ttk.Label(grp_ctrl, text="Status: Ready", font=("Segoe UI", 10, "italic"), foreground="#8a949e")
-        lbl_cfg_status.pack(side="bottom", pady=15)
-
-        config_widgets = {
-            "++mode": cb_mode, "++auto": cb_auto, "++eos": cb_eos, "++eoi": cb_eoi,
-            "++eot_enable": cb_eoten, "++eot_char": ent_eotchar, "++read_tmo_ms": ent_tmo,
-            "++lon": cb_lon, "++savecfg": cb_savecfg
-        }
-
-        btn_scan.config(command=lambda a=adapter, cw=config_widgets: self.run_bus_scan(a, tree, progress, btn_scan))
-
-        ttk.Button(grp_ctrl, text="Read from Adapter", command=lambda a=adapter, cw=config_widgets, sl=lbl_cfg_status: self.run_read_config(a, cw, sl)).pack(side="left", padx=5)
-        ttk.Button(grp_ctrl, text="Apply Configuration", command=lambda a=adapter, cw=config_widgets, sl=lbl_cfg_status: self.run_apply_config(a, cw, sl)).pack(side="left", padx=5)
-        ttk.Button(grp_ctrl, text="Set Scanner Defaults", command=lambda cw=config_widgets: self.set_scanner_defaults(cw)).pack(side="left", padx=5)
-        
-        ttk.Button(grp_ctrl, text="Reset Adapter (++rst)", command=lambda a=adapter: self.run_action_cmd(a, "++rst", "Adapter Reset Sequence Initiated")).pack(side="right", padx=5)
-        ttk.Button(grp_ctrl, text="Get Version (++ver)", command=lambda a=adapter: self.get_version(a)).pack(side="right", padx=5)
-
-        self.run_read_config(adapter, config_widgets, lbl_cfg_status)
+    def shutdown(self) -> None:
+        self._alive = False
+        if self._pump_id:
+            try:
+                self.after_cancel(self._pump_id)
+            except tk.TclError:
+                pass
 
 
-    # --- Interactive Terminal ---
+class LogPane(ttk.Frame):
+    def __init__(self, master, height: int = 6):
+        super().__init__(master)
+        self.text = tk.Text(self, height=height, wrap="none", state="disabled",
+                            font=("TkFixedFont", 9))
+        bar = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=bar.set)
+        self.text.grid(row=0, column=0, sticky="nsew")
+        bar.grid(row=0, column=1, sticky="ns")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
 
-    def build_terminal_tab(self, parent, adapter):
-        ttk.Label(parent, text="Send raw ++ controller commands or SCPI to the addressed instrument. "
-                               "SCPI queries (containing '?') are read back automatically. "
-                               "Up/Down arrows recall command history.",
-                  foreground="#5b7c99", wraplength=900).pack(pady=8, padx=20)
+    def write(self, line: str) -> None:
+        self.text.configure(state="normal")
+        self.text.insert("end", line.rstrip() + "\n")
+        self.text.see("end")
+        self.text.configure(state="disabled")
 
-        addr_frame = ttk.Frame(parent)
-        addr_frame.pack(fill="x", padx=20, pady=(0, 5))
-        ttk.Label(addr_frame, text="Target GPIB Address:").pack(side="left")
-        ent_addr = ttk.Entry(addr_frame, width=6)
-        ent_addr.pack(side="left", padx=8)
+    def clear(self) -> None:
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.configure(state="disabled")
 
-        log_frame = ttk.Frame(parent)
-        log_frame.pack(fill="both", expand=True, padx=20, pady=5)
-        log = tk.Text(log_frame, state="disabled", bg="#ffffff", fg="#343a40",
-                      font=("Consolas", 10), wrap="word", borderwidth=1, relief="solid")
-        log_sb = ttk.Scrollbar(log_frame, orient="vertical", command=log.yview)
-        log.configure(yscrollcommand=log_sb.set)
-        log.pack(side="left", fill="both", expand=True)
-        log_sb.pack(side="right", fill="y")
 
-        input_frame = ttk.Frame(parent, padding=(0, 5))
-        input_frame.pack(fill="x", padx=20, pady=(0, 15))
-        entry = ttk.Entry(input_frame, font=("Consolas", 10))
-        entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+class FieldDialog(tk.Toplevel):
+    """Modal editor for a handful of single-line fields."""
 
-        history = []
-        hist_pos = [0]
+    def __init__(self, master, title: str, fields: dict):
+        super().__init__(master)
+        self.title(title)
+        self.transient(master)
+        self.resizable(False, False)
+        self.result: Optional[dict] = None
+        self.vars: dict = {}
+        body = ttk.Frame(self, padding=PAD * 2)
+        body.pack(fill="both", expand=True)
+        for row, (label, value) in enumerate(fields.items()):
+            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w",
+                                             pady=3, padx=(0, PAD))
+            var = tk.StringVar(value=value)
+            self.vars[label] = var
+            entry = ttk.Entry(body, textvariable=var, width=48)
+            entry.grid(row=row, column=1, sticky="ew", pady=3)
+            if row == 0:
+                entry.focus_set()
+        buttons = ttk.Frame(body)
+        buttons.grid(row=len(fields), column=0, columnspan=2, sticky="e", pady=(PAD * 2, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right", padx=(PAD, 0))
+        ttk.Button(buttons, text="Save", command=self._save).pack(side="right")
+        self.bind("<Return>", lambda _e: self._save())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.grab_set()
+        self.wait_window(self)
 
-        def do_send(event=None):
-            cmd = entry.get().strip()
-            if not cmd:
-                return
-            history.append(cmd)
-            hist_pos[0] = len(history)
-            entry.delete(0, tk.END)
-            addr = ent_addr.get().strip()
-            self.terminal_send(adapter, cmd, addr, log)
+    def _save(self) -> None:
+        self.result = {k: v.get().strip() for k, v in self.vars.items()}
+        self.destroy()
 
-        def hist_up(event):
-            if history and hist_pos[0] > 0:
-                hist_pos[0] -= 1
-                entry.delete(0, tk.END)
-                entry.insert(0, history[hist_pos[0]])
-            return "break"
 
-        def hist_down(event):
-            if hist_pos[0] < len(history) - 1:
-                hist_pos[0] += 1
-                entry.delete(0, tk.END)
-                entry.insert(0, history[hist_pos[0]])
+def sortable(tree: ttk.Treeview, columns: tuple, numeric: tuple = ()) -> None:
+    """Click a heading to sort by it."""
+    state = {"col": None, "reverse": False}
+
+    def sort_by(col: str) -> None:
+        reverse = (not state["reverse"]) if state["col"] == col else False
+        state.update(col=col, reverse=reverse)
+        rows = [(tree.set(k, col), k) for k in tree.get_children("")]
+
+        def key(pair):
+            value = pair[0]
+            if col in numeric:
+                try:
+                    return (0, float(value))
+                except ValueError:
+                    return (1, 0.0)
+            return (0, value.lower())
+
+        rows.sort(key=key, reverse=reverse)
+        for index, (_v, k) in enumerate(rows):
+            tree.move(k, "", index)
+
+    for col in columns:
+        tree.heading(col, command=lambda c=col: sort_by(c))
+
+
+def build_tree(parent, spec, stretch=(), selectmode="browse"):
+    """A Treeview plus its scrollbar, gridded into a fresh container frame.
+
+    `spec` is ((key, heading, width), ...). Returns (container, tree).
+    """
+    container = ttk.Frame(parent)
+    container.columnconfigure(0, weight=1)
+    container.rowconfigure(0, weight=1)
+    cols = tuple(c[0] for c in spec)
+    tree = ttk.Treeview(container, columns=cols, show="headings", selectmode=selectmode)
+    for key, title, width in spec:
+        tree.heading(key, text=title)
+        tree.column(key, width=width, anchor="w", stretch=(key in stretch))
+    vbar = ttk.Scrollbar(container, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vbar.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vbar.grid(row=0, column=1, sticky="ns")
+    sortable(tree, cols, numeric=("addr", "gpib", "devices"))
+    return container, tree
+
+
+# ==========================================================================
+# Connections tab
+# ==========================================================================
+
+CONNECTION_COLUMNS = (
+    ("kind", "Type", 90), ("where", "Port / address", 220),
+    ("detail", "Description / MAC", 300), ("serial", "Adapter ID", 200),
+    ("devices", "Records", 75), ("state", "State", 110),
+    ("last_seen", "Last seen", 160),
+)
+
+
+class ConnectionsTab(QueuedFrame):
+    """Serial ports and NetFinder replies in one table. Open a controller and
+    it gets its own tab, the way a gateway does in LGI."""
+
+    def __init__(self, app: "App"):
+        super().__init__(app.notebook, padding=PAD)
+        self.app = app
+        self.worker: Optional[threading.Thread] = None
+        self.busy = False
+        self.live: dict[str, dict] = {}     # iid -> discovered/enumerated entry
+
+        controls = ttk.LabelFrame(self, text="Find controllers", padding=PAD)
+        controls.grid(row=0, column=0, sticky="ew")
+        controls.columnconfigure(6, weight=1)
+
+        self.serial_var = tk.BooleanVar(value=True)
+        self.netfinder_var = tk.BooleanVar(value=True)
+        self.timeout_var = tk.DoubleVar(value=5.0)
+
+        ttk.Checkbutton(controls, text="Serial ports", variable=self.serial_var).grid(
+            row=0, column=0, sticky="w")
+        ttk.Checkbutton(controls, text="NetFinder broadcast",
+                        variable=self.netfinder_var).grid(row=0, column=1, sticky="w",
+                                                          padx=(PAD, 2))
+        ttk.Label(controls, text="Listen (s)").grid(row=0, column=2, padx=(PAD * 2, 2))
+        ttk.Spinbox(controls, from_=1, to=30, increment=0.5, width=5,
+                    textvariable=self.timeout_var).grid(row=0, column=3)
+
+        buttons = ttk.Frame(controls)
+        buttons.grid(row=0, column=7, sticky="e")
+        self.find_btn = ttk.Button(buttons, text="Find controllers", command=self.start)
+        self.find_btn.pack(side="left")
+        ttk.Button(buttons, text="Add by address…", command=self.add_manual).pack(
+            side="left", padx=(PAD, 0))
+
+        self.progress = ttk.Progressbar(self, mode="determinate")
+        self.progress.grid(row=1, column=0, sticky="ew", pady=(PAD, 0))
+
+        table, self.tree = build_tree(self, CONNECTION_COLUMNS,
+                                      stretch=("detail", "last_seen"))
+        table.grid(row=2, column=0, sticky="nsew", pady=PAD)
+        self.tree.tag_configure("live", foreground=OK_FG)
+        self.tree.tag_configure("stale", foreground="#666666")
+        self.tree.tag_configure("open", foreground="#0b3f6b")
+        self.tree.bind("<Double-1>", lambda _e: self.open_selected())
+
+        actions = ttk.Frame(self)
+        actions.grid(row=3, column=0, sticky="ew")
+        ttk.Button(actions, text="Connect", command=self.open_selected).pack(side="left")
+        ttk.Button(actions, text="Forget records", command=self.forget_selected).pack(
+            side="left", padx=(PAD, 0))
+        ttk.Label(actions, text="Double-click a controller to open it in its own tab.",
+                  foreground=MUTED).pack(side="right")
+
+        self.log = LogPane(self, height=7)
+        self.log.grid(row=4, column=0, sticky="nsew", pady=(PAD, 0))
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=3)
+        self.rowconfigure(4, weight=1)
+
+        self.refresh()
+        self.log.write(f"{APP_NAME} {VERSION} - press Find controllers (F5) to enumerate "
+                       f"serial ports and broadcast for Ethernet adapters.")
+
+    # -- table -------------------------------------------------------------
+    def refresh(self) -> None:
+        """Merge what the database remembers with what is answering now."""
+        selected = self.tree.selection()
+        keep = selected[0] if selected else None
+        self.tree.delete(*self.tree.get_children(""))
+
+        rows = {}
+        for kind, where, serial_num, count, last_seen in known_adapters():
+            if not serial_num:
+                continue
+            rows[serial_num] = {
+                "kind": kind or "", "where": where or "", "detail": "",
+                "serial": serial_num, "devices": count, "state": "recorded",
+                "last_seen": last_seen or "",
+            }
+        for entry in self.live.values():
+            merged = rows.get(entry["serial"], {}).copy()
+            merged.update(entry)
+            merged.setdefault("devices", 0)
+            merged.setdefault("last_seen", "")
+            rows[entry["serial"]] = merged
+
+        for serial_num, row in sorted(rows.items(), key=lambda kv: (kv[1]["kind"],
+                                                                   kv[1]["where"])):
+            if serial_num in self.app.adapter_tabs:
+                tag = "open"
+                row["state"] = "connected"
+            elif row["state"] in ("responding", "present"):
+                tag = "live"
             else:
-                hist_pos[0] = len(history)
-                entry.delete(0, tk.END)
-            return "break"
+                tag = "stale"
+            self.tree.insert("", "end", iid=serial_num, tags=(tag,),
+                             values=(row["kind"], row["where"], row["detail"],
+                                     serial_num, row["devices"], row["state"],
+                                     row["last_seen"]))
+        if keep and self.tree.exists(keep):
+            self.tree.selection_set(keep)
 
-        entry.bind("<Return>", do_send)
-        entry.bind("<Up>", hist_up)
-        entry.bind("<Down>", hist_down)
+    def selected_row(self) -> Optional[dict]:
+        selection = self.tree.selection()
+        if not selection:
+            return None
+        values = self.tree.item(selection[0])["values"]
+        return {"kind": str(values[0]), "where": str(values[1]),
+                "detail": str(values[2]), "serial": str(values[3])}
 
-        ttk.Button(input_frame, text="Send", command=do_send).pack(side="left", padx=4)
+    # -- discovery ---------------------------------------------------------
+    def start(self) -> None:
+        if self.busy:
+            return
+        if not (self.serial_var.get() or self.netfinder_var.get()):
+            messagebox.showinfo(APP_NAME, "Choose serial ports, NetFinder, or both.")
+            return
+        self.busy = True
+        self.find_btn.configure(state="disabled")
+        self.progress.configure(value=0, maximum=100)
+        self.log.write("─" * 60)
+        self.app.set_status("Searching for controllers…")
+        self.worker = threading.Thread(
+            target=self._work, daemon=True,
+            kwargs=dict(do_serial=self.serial_var.get(),
+                        do_net=self.netfinder_var.get(),
+                        timeout=self.timeout_var.get()))
+        self.worker.start()
 
-        def clear_log():
-            log.config(state="normal")
-            log.delete("1.0", tk.END)
-            log.config(state="disabled")
-        ttk.Button(input_frame, text="Clear", command=clear_log).pack(side="left", padx=4)
-
-    def terminal_send(self, adapter, cmd, addr, log_widget):
-        threading.Thread(target=self._terminal_send_thread,
-                         args=(adapter, cmd, addr, log_widget), daemon=True).start()
-
-    def _terminal_send_thread(self, adapter, cmd, addr, log_widget):
+    def _work(self, do_serial: bool, do_net: bool, timeout: float) -> None:
         try:
-            adapter.flush_input()
-            if addr and not cmd.startswith("++"):
-                adapter.write(f"++addr {addr}")
-            self._term_log(log_widget, f"> {cmd}")
-            adapter.write(cmd)
-            if cmd.startswith("++"):
-                # Controller commands: query forms reply, set forms don't.
-                time.sleep(0.1)
-                resp = adapter.read().strip()
-                self._term_log(log_widget, f"< {resp}" if resp else "< (no response)")
-            elif "?" in cmd:
-                # SCPI query: trigger a bus read for the answer
-                adapter.write("++read eoi")
-                time.sleep(0.1)
-                resp = adapter.read().strip()
-                self._term_log(log_widget, f"< {resp}" if resp else "< (no response / timeout)")
-            # SCPI non-query commands produce no reply; nothing to read.
-        except Exception as e:
-            self._term_log(log_widget, f"! Error: {e}")
+            if do_serial:
+                self.q.put(("log", "Enumerating serial ports…"))
+                for device, description, serial_num in list_serial_ports():
+                    self.q.put(("serial_port", device, description, serial_num))
+                self.q.put(("progress", 40))
+            if do_net:
+                self.q.put(("log", f"NetFinder broadcast, listening {timeout:g} s…"))
+                found = netfinder_discover(timeout, emit=lambda t: self.q.put(("log", t)))
+                for ip, mac in found:
+                    self.q.put(("netfinder", ip, mac))
+            self.q.put(("progress", 100))
+        except Exception as exc:
+            self.q.put(("log", f"Discovery failed: {exc}"))
+        finally:
+            self.q.put(("done",))
 
-    def _term_log(self, log_widget, line):
-        def append():
-            if not log_widget.winfo_exists():
-                return
-            log_widget.config(state="normal")
-            log_widget.insert(tk.END, line + "\n")
-            log_widget.see(tk.END)
-            log_widget.config(state="disabled")
-        if self.root.winfo_exists():
-            self.root.after(0, append)
+    def on_event(self, kind: str, *args) -> None:
+        if kind == "log":
+            self.log.write(args[0])
+        elif kind == "progress":
+            self.progress.configure(value=args[0])
+        elif kind == "serial_port":
+            device, description, serial_num = args
+            self.live[serial_num] = {"kind": "USB", "where": device,
+                                     "detail": description, "serial": serial_num,
+                                     "state": "present"}
+            self.log.write(f"Serial port {device} - {description}")
+        elif kind == "netfinder":
+            ip, mac = args
+            self.live[mac] = {"kind": "Ethernet", "where": ip, "detail": f"MAC {mac}",
+                              "serial": mac, "state": "responding"}
+        elif kind == "done":
+            self.busy = False
+            self.find_btn.configure(state="normal")
+            self.progress.configure(value=100)
+            self.refresh()
+            self.app.set_status("Discovery finished")
+        elif kind == "connect_failed":
+            desc, message = args
+            self.log.write(f"! {desc}: {message}")
+            messagebox.showerror("Connection Error", f"{desc}\n\n{message}")
+            self.app.set_status("Connection failed")
+        elif kind == "connect_result":
+            adapter, desc, verdict, message = args
+            self._finish_connect(adapter, desc, verdict, message)
 
-    # --- Configuration Methods ---
+    # -- connecting --------------------------------------------------------
+    def add_manual(self) -> None:
+        dialog = FieldDialog(self, "Add a controller by address",
+                             {"Host or IP": "", "Port": str(PROLOGIX_TCP_PORT)})
+        if not dialog.result:
+            return
+        host = dialog.result["Host or IP"].strip()
+        if not host:
+            return
+        self.connect_ethernet(host, self.live.get(host, {}).get("serial", f"Manual_{host}"))
 
-    def run_read_config(self, adapter, config_widgets, status_lbl):
-        status_lbl.config(text="Status: Reading from adapter...", foreground="#5b7c99")
-        threading.Thread(target=self.read_config_thread, args=(adapter, config_widgets, status_lbl), daemon=True).start()
+    def open_selected(self) -> None:
+        row = self.selected_row()
+        if row is None:
+            messagebox.showinfo(APP_NAME, "Select a controller first.")
+            return
+        if row["serial"] in self.app.adapter_tabs:
+            self.app.focus_adapter_tab(row["serial"])
+            return
+        if row["kind"] == "USB":
+            self.connect_serial(row["where"], row["serial"])
+        elif row["kind"] == "Ethernet":
+            self.connect_ethernet(row["where"], row["serial"])
+        else:
+            messagebox.showinfo(APP_NAME, "This record has no usable connection type.")
 
-    def read_config_thread(self, adapter, config_widgets, status_lbl):
+    def connect_serial(self, port: str, serial_num: str) -> None:
+        self._connect(lambda: USBAdapter(port, serial_num), port)
+
+    def connect_ethernet(self, ip: str, mac: str) -> None:
+        self._connect(lambda: EthernetAdapter(ip, mac), ip)
+
+    def _connect(self, factory, desc: str) -> None:
+        self.log.write(f"Opening {desc}…")
+        self.app.set_status(f"Opening {desc}…")
+        threading.Thread(target=self._connect_work, args=(factory, desc),
+                         daemon=True).start()
+
+    def _connect_work(self, factory, desc: str) -> None:
+        """Open and validate off the main thread; the GUI decides what to do."""
         try:
-            for cmd, widget in config_widgets.items():
-                adapter.write(cmd)
-                time.sleep(0.05)
-                val = adapter.read()
-                if self.root.winfo_exists():
-                    self.root.after(0, self.update_widget_value, widget, val)
-            if self.root.winfo_exists():
-                self.root.after(0, lambda: status_lbl.config(text="Status: Configuration Read Successfully", foreground="#5ca86c"))
-        except Exception as e:
-            msg = str(e)
-            if self.root.winfo_exists():
-                self.root.after(0, lambda m=msg: status_lbl.config(text=f"Status: Read Error - {m}", foreground="#a85c5c"))
+            adapter = factory()
+        except Exception as exc:
+            self.q.put(("connect_failed", desc, str(exc)))
+            return
+        try:
+            verdict, message = probe_controller(adapter, desc)
+        except Exception as exc:
+            adapter.close()
+            self.q.put(("connect_failed", desc, f"Validation failed: {exc}"))
+            return
+        self.q.put(("connect_result", adapter, desc, verdict, message))
 
-    def update_widget_value(self, widget, val):
-        if not val: return
+    def _finish_connect(self, adapter, desc: str, verdict: str, message: str) -> None:
+        if verdict == "reject":
+            adapter.close()
+            self.log.write(f"! {desc} rejected by validation.")
+            messagebox.showerror("Hardware Validation Failed", message)
+            self.app.set_status("Validation failed")
+            return
+        if verdict == "ask" and not messagebox.askyesno("Unrecognized Controller", message):
+            adapter.close()
+            self.log.write(f"{desc}: connection declined.")
+            self.app.set_status("Ready")
+            return
+        if verdict == "ok":
+            self.log.write(f"{desc}: {message}")
+        self.app.open_adapter(adapter)
+        self.refresh()
+
+    # -- records -----------------------------------------------------------
+    def forget_selected(self) -> None:
+        row = self.selected_row()
+        if row is None:
+            return
+        if row["serial"] in self.app.adapter_tabs:
+            messagebox.showinfo(APP_NAME, "Close the controller's tab first.")
+            return
+        if not messagebox.askyesno(
+                "Confirm Delete",
+                f"Delete every recorded instrument for adapter {row['serial']}?"):
+            return
+        with sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT) as conn:
+            conn.execute("DELETE FROM devices WHERE adapter_serial = ?", (row["serial"],))
+            conn.commit()
+        self.live.pop(row["serial"], None)
+        self.refresh()
+        self.app.database_tab.refresh()
+        self.log.write(f"Forgot records for {row['serial']}.")
+
+    def shutdown(self) -> None:
+        super().shutdown()
+
+
+# ==========================================================================
+# Adapter tab - one per connected controller
+# ==========================================================================
+
+BUS_COLUMNS = (
+    ("addr", "Addr", 55), ("state", "State", 100), ("stb", "Status byte", 150),
+    ("idn", "*IDN? response", 460), ("tc", "TC definition", 190),
+    ("last_seen", "Last seen", 160),
+)
+
+CONFIG_FIELDS = (
+    ("++mode", "Mode", ("0 (Device)", "1 (Controller)"), "grp1"),
+    ("++auto", "Read-After-Write", ("0 (Disable)", "1 (Enable)"), "grp1"),
+    ("++lon", "Listen-Only", ("0 (Disable)", "1 (Enable)"), "grp1"),
+    ("++savecfg", "Save Config", ("0 (Disable)", "1 (Enable)"), "grp1"),
+    ("++eos", "Terminator", ("0 (CR+LF)", "1 (CR)", "2 (LF)", "3 (None)"), "grp2"),
+    ("++eoi", "Assert EOI", ("0 (Disable)", "1 (Enable)"), "grp2"),
+    ("++eot_enable", "EOT Enable", ("0 (Disable)", "1 (Enable)"), "grp2"),
+    ("++read_tmo_ms", "Timeout (ms)", None, "grp2"),
+    ("++eot_char", "EOT Char", None, "grp2"),
+)
+
+
+class AdapterTab(QueuedFrame):
+    """Three panes behind one controller: the bus inventory, the controller's
+    own configuration, and a raw terminal."""
+
+    def __init__(self, app: "App", adapter: PrologixAdapter):
+        super().__init__(app.notebook, padding=PAD)
+        self.app = app
+        self.adapter = adapter
+        self.stop_event = threading.Event()
+        self.worker: Optional[threading.Thread] = None
+        self.io_lock = threading.Lock()     # one conversation on the bus at a time
+        self.history: list[str] = []
+        self.history_pos = 0
+        self.config_widgets: dict[str, tk.Widget] = {}
+
+        header = ttk.Frame(self)
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(1, weight=1)
+        ttk.Label(header, text=f"{adapter.adapter_type} controller at {adapter.port_or_ip}",
+                  font=("TkDefaultFont", 11, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text=f"   adapter ID {adapter.serial_num}",
+                  foreground=MUTED).grid(row=0, column=1, sticky="w")
+        ttk.Button(header, text="Close tab",
+                   command=lambda: self.app.close_adapter_tab(adapter.serial_num)).grid(
+            row=0, column=2, sticky="e")
+
+        self.inner = ttk.Notebook(self)
+        self.inner.grid(row=1, column=0, sticky="nsew", pady=(PAD, 0))
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        self._build_bus_pane()
+        self._build_config_pane()
+        self._build_terminal_pane()
+
+        self.load_from_db()
+        self.read_config()
+
+    # -- bus inventory -----------------------------------------------------
+    def _build_bus_pane(self) -> None:
+        pane = ttk.Frame(self.inner, padding=PAD)
+        self.inner.add(pane, text="Bus inventory")
+        pane.columnconfigure(0, weight=1)
+        pane.rowconfigure(2, weight=3)
+        pane.rowconfigure(4, weight=1)
+
+        controls = ttk.LabelFrame(pane, text="Scan", padding=PAD)
+        controls.grid(row=0, column=0, sticky="ew")
+        controls.columnconfigure(6, weight=1)
+
+        self.first_var = tk.IntVar(value=0)
+        self.last_var = tk.IntVar(value=30)
+
+        ttk.Label(controls, text="Addresses").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(controls, from_=0, to=30, width=4,
+                    textvariable=self.first_var).grid(row=0, column=1, padx=(4, 2))
+        ttk.Label(controls, text="to").grid(row=0, column=2)
+        ttk.Spinbox(controls, from_=0, to=30, width=4,
+                    textvariable=self.last_var).grid(row=0, column=3, padx=(2, PAD))
+
+        buttons = ttk.Frame(controls)
+        buttons.grid(row=0, column=7, sticky="e")
+        self.scan_btn = ttk.Button(buttons, text="Scan GPIB bus", command=self.start_scan)
+        self.scan_btn.pack(side="left")
+        self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_scan,
+                                   state="disabled")
+        self.stop_btn.pack(side="left", padx=(PAD, 0))
+        ttk.Button(buttons, text="Export CSV…",
+                   command=lambda: self.app.export_csv(self.adapter.serial_num)).pack(
+            side="left", padx=(PAD, 0))
+        ttk.Button(buttons, text="Export JSON…",
+                   command=lambda: self.app.export_json(self.adapter.serial_num)).pack(
+            side="left", padx=(PAD, 0))
+        ttk.Label(controls,
+                  text="A scan forces Controller / Auto off / EOS none / EOI on for the "
+                       "session only - nothing is written to the adapter's EEPROM.",
+                  foreground=MUTED).grid(row=1, column=0, columnspan=8, sticky="w",
+                                         pady=(4, 0))
+
+        self.progress = ttk.Progressbar(pane, mode="determinate")
+        self.progress.grid(row=1, column=0, sticky="ew", pady=(PAD, 0))
+
+        table, self.tree = build_tree(pane, BUS_COLUMNS, stretch=("idn",),
+                                      selectmode="extended")
+        table.grid(row=2, column=0, sticky="nsew", pady=PAD)
+        self.tree.tag_configure("found", foreground=OK_FG)
+        self.tree.tag_configure("missing", foreground="#666666")
+        self.tree.bind("<Double-1>", lambda _e: self.send_to_terminal())
+
+        actions = ttk.Frame(pane)
+        actions.grid(row=3, column=0, sticky="ew")
+        ttk.Button(actions, text="Address in terminal",
+                   command=self.send_to_terminal).pack(side="left")
+        ttk.Button(actions, text="Re-query *IDN?",
+                   command=self.requery_selected).pack(side="left", padx=(PAD, 0))
+        ttk.Button(actions, text="Delete record(s)",
+                   command=self.delete_selected).pack(side="left", padx=(PAD, 0))
+        ttk.Label(actions, text="Double-click a row to load its address into the terminal.",
+                  foreground=MUTED).pack(side="right")
+
+        self.log = LogPane(pane, height=7)
+        self.log.grid(row=4, column=0, sticky="nsew", pady=(PAD, 0))
+
+    # -- controller configuration -----------------------------------------
+    def _build_config_pane(self) -> None:
+        pane = ttk.Frame(self.inner, padding=PAD)
+        self.inner.add(pane, text="Configuration")
+        pane.columnconfigure(0, weight=1)
+        pane.rowconfigure(4, weight=1)
+
+        groups = {
+            "grp1": ttk.LabelFrame(pane, text="Operating mode & general", padding=PAD),
+            "grp2": ttk.LabelFrame(pane, text="Formatting & timeouts", padding=PAD),
+        }
+        groups["grp1"].grid(row=0, column=0, sticky="ew")
+        groups["grp2"].grid(row=1, column=0, sticky="ew", pady=(PAD, 0))
+        positions = {"grp1": 0, "grp2": 0}
+
+        for cmd, label, values, group in CONFIG_FIELDS:
+            parent = groups[group]
+            index = positions[group]
+            positions[group] += 1
+            row, col = divmod(index, 2)
+            ttk.Label(parent, text=f"{label} ({cmd}):").grid(
+                row=row, column=col * 2, sticky="e", padx=(0, 4), pady=3)
+            if values:
+                widget = ttk.Combobox(parent, values=list(values), state="readonly", width=16)
+            else:
+                widget = ttk.Entry(parent, width=19)
+            widget.grid(row=row, column=col * 2 + 1, sticky="w", padx=(0, PAD * 2), pady=3)
+            self.config_widgets[cmd] = widget
+
+        immediate = ttk.LabelFrame(pane, text="Immediate actions", padding=PAD)
+        immediate.grid(row=2, column=0, sticky="ew", pady=(PAD, 0))
+        for text, cmd, note in (
+                ("Interface Clear (++ifc)", "++ifc", "Interface clear sent"),
+                ("Device Clear (++clr)", "++clr", "Device clear sent"),
+                ("Local Lockout (++llo)", "++llo", "Local lockout sent"),
+                ("Go to Local (++loc)", "++loc", "Go to local sent"),
+                ("Reset Adapter (++rst)", "++rst", "Adapter reset sequence started")):
+            ttk.Button(immediate, text=text,
+                       command=lambda c=cmd, n=note: self.run_action(c, n)).pack(
+                side="left", padx=(0, PAD))
+
+        bar = ttk.Frame(pane)
+        bar.grid(row=3, column=0, sticky="ew", pady=(PAD, 0))
+        ttk.Button(bar, text="Read from adapter", command=self.read_config).pack(side="left")
+        ttk.Button(bar, text="Apply configuration", command=self.apply_config).pack(
+            side="left", padx=(PAD, 0))
+        ttk.Button(bar, text="Set scanner defaults", command=self.set_scanner_defaults).pack(
+            side="left", padx=(PAD, 0))
+        ttk.Button(bar, text="Get version (++ver)", command=self.get_version).pack(
+            side="right")
+        self.config_status = ttk.Label(pane, text="Ready", foreground=MUTED)
+        self.config_status.grid(row=4, column=0, sticky="nw", pady=(PAD, 0))
+
+    # -- terminal ----------------------------------------------------------
+    def _build_terminal_pane(self) -> None:
+        pane = ttk.Frame(self.inner, padding=PAD)
+        self.inner.add(pane, text="Terminal")
+        pane.columnconfigure(0, weight=1)
+        pane.rowconfigure(1, weight=1)
+
+        bar = ttk.Frame(pane)
+        bar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(bar, text="GPIB address").pack(side="left")
+        self.term_addr_var = tk.StringVar()
+        self.term_addr_box = ttk.Combobox(bar, textvariable=self.term_addr_var, width=6,
+                                          values=[str(a) for a in range(31)])
+        self.term_addr_box.pack(side="left", padx=(2, PAD))
+        ttk.Button(bar, text="Serial poll",
+                   command=lambda: self.terminal_action("spoll")).pack(side="left")
+        ttk.Button(bar, text="Read",
+                   command=lambda: self.terminal_action("read")).pack(side="left",
+                                                                      padx=(PAD, 0))
+        ttk.Button(bar, text="Clear log", command=lambda: self.term_out.clear()).pack(
+            side="left", padx=(PAD, 0))
+        ttk.Label(bar, text="Leave the address blank to talk to the controller only.",
+                  foreground=MUTED).pack(side="right")
+
+        self.term_out = LogPane(pane, height=18)
+        self.term_out.grid(row=1, column=0, sticky="nsew", pady=PAD)
+
+        entry_row = ttk.Frame(pane)
+        entry_row.grid(row=2, column=0, sticky="ew")
+        entry_row.columnconfigure(0, weight=1)
+        self.command_var = tk.StringVar()
+        self.command_entry = ttk.Entry(entry_row, textvariable=self.command_var,
+                                       font=("TkFixedFont", 10))
+        self.command_entry.grid(row=0, column=0, sticky="ew")
+        self.command_entry.bind("<Return>", lambda _e: self.terminal_action("auto"))
+        self.command_entry.bind("<Up>", self._history_back)
+        self.command_entry.bind("<Down>", self._history_forward)
+        ttk.Button(entry_row, text="Send",
+                   command=lambda: self.terminal_action("auto")).grid(row=0, column=1,
+                                                                      padx=(PAD, 0))
+        ttk.Label(pane, text="A ++ command is written and read back; a SCPI command "
+                             "ending in ? triggers ++read eoi; anything else is "
+                             "write-only. Up/Down recall history.",
+                  foreground=MUTED).grid(row=3, column=0, sticky="w", pady=(2, 0))
+
+    # -- table -------------------------------------------------------------
+    def load_from_db(self) -> None:
+        self.tree.delete(*self.tree.get_children(""))
+        for row in fetch_all_devices(self.adapter.serial_num):
+            (_kind, _where, _serial, addr, idn, status, last_seen,
+             tc_config, stb) = row
+            self._put_row(addr, status, stb, idn, tc_config, last_seen)
+
+    def _put_row(self, addr, status, stb, idn, tc_config, last_seen) -> None:
+        iid = str(addr)
+        values = (addr, status or "", decode_status_byte(stb), idn or "",
+                  tc_config or "", last_seen or "")
+        tag = "found" if (status or "").lower() == "found" else "missing"
+        if self.tree.exists(iid):
+            self.tree.item(iid, values=values, tags=(tag,))
+        else:
+            self.tree.insert("", "end", iid=iid, values=values, tags=(tag,))
+
+    def selected_addresses(self) -> list:
+        out = []
+        for iid in self.tree.selection():
+            try:
+                out.append(int(self.tree.set(iid, "addr")))
+            except (ValueError, tk.TclError):
+                continue
+        return out
+
+    # -- scanning ----------------------------------------------------------
+    def start_scan(self) -> None:
+        if self.worker and self.worker.is_alive():
+            return
+        first, last = self.first_var.get(), self.last_var.get()
+        if first > last:
+            messagebox.showinfo(APP_NAME, "The first address must not exceed the last.")
+            return
+        self.stop_event.clear()
+        self.scan_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.progress.configure(value=0, maximum=last - first + 1)
+        self.log.write("─" * 60)
+        self.log.write(f"Scanning addresses {first}–{last} on {self.adapter.port_or_ip}")
+        self.app.set_status(f"Scanning {self.adapter.port_or_ip}…")
+        self.worker = threading.Thread(target=self._scan_work, args=(first, last),
+                                       daemon=True)
+        self.worker.start()
+
+    def stop_scan(self) -> None:
+        self.stop_event.set()
+        self.log.write("Stop requested…")
+
+    def _scan_work(self, first: int, last: int) -> None:
+        try:
+            with self.io_lock:
+                records, present = scan_bus(
+                    self.adapter, first, last, self.stop_event,
+                    emit=lambda kind, *a: self.q.put((kind, *a)))
+            if not self.stop_event.is_set():
+                upsert_devices_batch(records)
+                mark_missing_devices(self.adapter.serial_num, [r[3] for r in records],
+                                     first, last)
+            self.q.put(("scan_done", len(records), len(present)))
+        except Exception as exc:
+            self.q.put(("log", f"! Scan failed: {exc}"))
+            self.q.put(("scan_done", 0, 0))
+
+    def on_event(self, kind: str, *args) -> None:
+        if kind == "log":
+            self.log.write(args[0])
+        elif kind == "progress":
+            done, total = args
+            self.progress.configure(value=done, maximum=total)
+        elif kind == "row":
+            (_kind, _where, _serial, addr, idn, status, stb) = args[0]
+            self._put_row(addr, status, stb, idn, None, now_stamp())
+        elif kind == "scan_done":
+            found, present = args
+            self.scan_btn.configure(state="normal")
+            self.stop_btn.configure(state="disabled")
+            if self.stop_event.is_set():
+                self.log.write("Scan stopped; nothing was written to the database.")
+                self.app.set_status("Scan stopped")
+            else:
+                self.log.write(f"Scan complete: {found} instrument(s) identified "
+                               f"at {present} live address(es).")
+                self.load_from_db()
+                self.app.database_tab.refresh()
+                self.app.set_status(f"{self.adapter.port_or_ip}: {found} instrument(s)")
+        elif kind == "term":
+            self.term_out.write(args[0])
+        elif kind == "cfgvalue":
+            self._set_widget_value(args[0], args[1])
+        elif kind == "cfgstatus":
+            text, colour = args
+            self.config_status.configure(text=text, foreground=colour)
+        elif kind == "info":
+            messagebox.showinfo(*args)
+        elif kind == "error":
+            messagebox.showerror(*args)
+
+    # -- row actions -------------------------------------------------------
+    def send_to_terminal(self) -> None:
+        addrs = self.selected_addresses()
+        if not addrs:
+            return
+        self.term_addr_var.set(str(addrs[0]))
+        self.inner.select(2)
+        self.command_entry.focus_set()
+
+    def requery_selected(self) -> None:
+        addrs = self.selected_addresses()
+        if not addrs:
+            messagebox.showinfo(APP_NAME, "Select one or more addresses first.")
+            return
+        threading.Thread(target=self._requery_work, args=(addrs,), daemon=True).start()
+
+    def _requery_work(self, addrs) -> None:
+        records = []
+        try:
+            with self.io_lock:
+                for addr in addrs:
+                    self.adapter.flush_input()
+                    self.adapter.write(f"++spoll {addr}")
+                    reply = (self.adapter.read() or "").strip()
+                    stb = int(reply) if reply.isdigit() and 0 <= int(reply) <= 255 else None
+                    self.adapter.flush_input()
+                    self.adapter.write(f"++addr {addr}")
+                    self.adapter.write("*IDN?")
+                    self.adapter.write("++read eoi")
+                    idn = (self.adapter.read() or "").strip()
+                    status = "Found" if (stb is not None or idn) else "NotFound"
+                    idn = idn or "(present, no *IDN? response - pre-488.2 device)"
+                    record = (self.adapter.adapter_type, self.adapter.port_or_ip,
+                              self.adapter.serial_num, addr, idn, status, stb)
+                    records.append(record)
+                    self.q.put(("log", f"  {addr:>2}  {idn}"))
+                    self.q.put(("row", record))
+            upsert_devices_batch(records)
+        except Exception as exc:
+            self.q.put(("log", f"! Re-query failed: {exc}"))
+
+    def delete_selected(self) -> None:
+        addrs = self.selected_addresses()
+        if not addrs:
+            messagebox.showinfo(APP_NAME, "Select one or more records first.")
+            return
+        if not messagebox.askyesno(
+                "Confirm Delete",
+                f"Delete {len(addrs)} record{'s' if len(addrs) > 1 else ''} for this adapter?"):
+            return
+        delete_device_records([(a, self.adapter.serial_num) for a in addrs])
+        self.load_from_db()
+        self.app.database_tab.refresh()
+        self.log.write(f"Deleted {len(addrs)} record(s).")
+
+    # -- configuration -----------------------------------------------------
+    def read_config(self) -> None:
+        self.config_status.configure(text="Reading from adapter…", foreground=MUTED)
+        threading.Thread(target=self._read_config_work, daemon=True).start()
+
+    def _read_config_work(self) -> None:
+        try:
+            with self.io_lock:
+                for cmd in self.config_widgets:
+                    self.adapter.write(cmd)
+                    time.sleep(0.05)
+                    value = (self.adapter.read() or "").strip()
+                    if value:
+                        self.q.put(("cfgvalue", cmd, value))
+            self.q.put(("cfgstatus", "Configuration read successfully", OK_FG))
+        except Exception as exc:
+            self.q.put(("cfgstatus", f"Read error - {exc}", BAD_FG))
+
+    def _set_widget_value(self, cmd: str, value: str) -> None:
+        widget = self.config_widgets.get(cmd)
+        if widget is None or not value:
+            return
         if isinstance(widget, ttk.Combobox):
-            for option in widget['values']:
-                if option.startswith(val):
+            for option in widget["values"]:
+                if option.startswith(value):
                     widget.set(option)
-                    break
-        elif isinstance(widget, ttk.Entry):
+                    return
+            widget.set(value)
+        else:
             widget.delete(0, tk.END)
-            widget.insert(0, val)
+            widget.insert(0, value)
 
-    def run_apply_config(self, adapter, config_values, status_lbl):
-        config_values_dict = {}
-        for cmd, widget in config_values.items():
-            val = widget.get()
-            if " (" in val:
-                val = val.split(" ")[0]
-            config_values_dict[cmd] = val
-        status_lbl.config(text="Status: Applying configuration...", foreground="#5b7c99")
-        threading.Thread(target=self.apply_config_thread, args=(adapter, config_values_dict, status_lbl), daemon=True).start()
+    def apply_config(self) -> None:
+        values = {}
+        for cmd, widget in self.config_widgets.items():
+            value = widget.get().strip()
+            if not value:
+                continue
+            values[cmd] = value.split(" ")[0] if " (" in value else value
+        self.config_status.configure(text="Applying configuration…", foreground=MUTED)
+        threading.Thread(target=self._apply_config_work, args=(values,), daemon=True).start()
 
-    def apply_config_thread(self, adapter, config_values, status_lbl):
+    def _apply_config_work(self, values: dict) -> None:
         try:
             # Send ++savecfg last: once savecfg is enabled, every subsequent
             # config command triggers an EEPROM write (limited write cycles).
-            savecfg_val = config_values.pop("++savecfg", None)
-            for cmd, val in config_values.items():
-                adapter.write(f"{cmd} {val}")
-                time.sleep(0.05)
-            if savecfg_val is not None:
-                adapter.write(f"++savecfg {savecfg_val}")
-                time.sleep(0.05)
-            if self.root.winfo_exists():
-                self.root.after(0, lambda: status_lbl.config(text="Status: Configuration Applied Successfully", foreground="#5ca86c"))
-        except Exception as e:
-            msg = str(e)
-            if self.root.winfo_exists():
-                self.root.after(0, lambda m=msg: status_lbl.config(text=f"Status: Apply Error - {m}", foreground="#a85c5c"))
+            savecfg = values.pop("++savecfg", None)
+            with self.io_lock:
+                for cmd, value in values.items():
+                    self.adapter.write(f"{cmd} {value}")
+                    time.sleep(0.05)
+                if savecfg is not None:
+                    self.adapter.write(f"++savecfg {savecfg}")
+                    time.sleep(0.05)
+            self.q.put(("cfgstatus", "Configuration applied successfully", OK_FG))
+        except Exception as exc:
+            self.q.put(("cfgstatus", f"Apply error - {exc}", BAD_FG))
 
-    def set_scanner_defaults(self, config_widgets):
-        config_widgets['++mode'].set("1 (Controller)")
-        config_widgets['++auto'].set("0 (Disable)")
-        config_widgets['++eos'].set("3 (None)")
-        config_widgets['++eoi'].set("1 (Enable)")
-        config_widgets['++read_tmo_ms'].delete(0, tk.END)
-        config_widgets['++read_tmo_ms'].insert(0, "200")
+    def set_scanner_defaults(self) -> None:
+        for cmd, value in (("++mode", "1 (Controller)"), ("++auto", "0 (Disable)"),
+                           ("++eos", "3 (None)"), ("++eoi", "1 (Enable)"),
+                           ("++read_tmo_ms", "200")):
+            self._set_widget_value(cmd, value.split(" ")[0] if " (" in value else value)
+        self.config_status.configure(text="Scanner defaults loaded - not yet applied.",
+                                     foreground=MUTED)
 
-    def run_action_cmd(self, adapter, cmd, success_msg):
+    def run_action(self, cmd: str, note: str) -> None:
+        threading.Thread(target=self._action_work, args=(cmd, note), daemon=True).start()
+
+    def _action_work(self, cmd: str, note: str) -> None:
         try:
-            adapter.write(cmd)
-            messagebox.showinfo("Command Sent", success_msg)
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+            with self.io_lock:
+                self.adapter.write(cmd)
+            self.q.put(("cfgstatus", note, OK_FG))
+            self.q.put(("term", f"> {cmd}"))
+        except Exception as exc:
+            self.q.put(("cfgstatus", f"{cmd} failed - {exc}", BAD_FG))
 
-    def get_version(self, adapter):
+    def get_version(self) -> None:
+        threading.Thread(target=self._version_work, daemon=True).start()
+
+    def _version_work(self) -> None:
         try:
-            adapter.write("++ver")
-            time.sleep(0.1)
-            msg = adapter.read()
-            messagebox.showinfo("Adapter Version", f"Response from Adapter:\n\n{msg}")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+            with self.io_lock:
+                self.adapter.flush_input()
+                self.adapter.write("++ver")
+                time.sleep(0.1)
+                reply = (self.adapter.read() or "").strip()
+            self.q.put(("info", "Adapter Version", f"Response from adapter:\n\n{reply}"))
+            self.q.put(("cfgstatus", reply or "No response to ++ver",
+                        OK_FG if reply else BAD_FG))
+        except Exception as exc:
+            self.q.put(("error", "Error", str(exc)))
 
-    # --- Scanning & Export Methods ---
+    # -- terminal ----------------------------------------------------------
+    def terminal_action(self, action: str) -> None:
+        addr = self.term_addr_var.get().strip()
+        if action == "auto":
+            command = self.command_var.get().strip()
+            if not command:
+                return
+            self.history.append(command)
+            self.history_pos = len(self.history)
+            self.command_var.set("")
+        elif action == "spoll":
+            if not addr:
+                self.term_out.write("! Serial poll needs a GPIB address.")
+                return
+            command = f"++spoll {addr}"
+            addr = ""
+        elif action == "read":
+            command = "++read eoi"
+        else:
+            return
+        threading.Thread(target=self._terminal_work, args=(command, addr),
+                         daemon=True).start()
 
-    def populate_adapter_tree(self, tree, serial_num):
-        for item in tree.get_children():
-            tree.delete(item)
-        rows = fetch_all_devices(serial_num)
-        for i, row in enumerate(rows):
-            tag = 'evenrow' if i % 2 == 0 else 'oddrow'
-            display = list(row[:7]) + [decode_status_byte(row[8])]
-            tree.insert("", tk.END, values=display, tags=(tag,))
+    def _terminal_work(self, command: str, addr: str) -> None:
+        try:
+            with self.io_lock:
+                self.adapter.flush_input()
+                if addr and not command.startswith("++"):
+                    self.adapter.write(f"++addr {addr}")
+                self.q.put(("term", f"> {command}"))
+                self.adapter.write(command)
+                if command.startswith("++"):
+                    # Controller commands: query forms reply, set forms don't.
+                    time.sleep(0.1)
+                    reply = (self.adapter.read() or "").strip()
+                    self.q.put(("term", f"< {reply}" if reply else "< (no response)"))
+                elif "?" in command:
+                    # SCPI query: trigger a bus read for the answer.
+                    self.adapter.write("++read eoi")
+                    time.sleep(0.1)
+                    reply = (self.adapter.read() or "").strip()
+                    self.q.put(("term", f"< {reply}" if reply
+                                else "< (no response / timeout)"))
+                # SCPI non-query commands produce no reply; nothing to read.
+        except Exception as exc:
+            self.q.put(("term", f"! Error: {exc}"))
 
-    def run_bus_scan(self, adapter, tree, progress, btn):
-        btn.config(state="disabled")
-        progress["value"] = 0
-        progress["maximum"] = 30
-        threading.Thread(target=self.scan_thread, args=(adapter, tree, progress, btn), daemon=True).start()
+    def _history_back(self, _event) -> str:
+        if self.history and self.history_pos > 0:
+            self.history_pos -= 1
+            self.command_var.set(self.history[self.history_pos])
+        return "break"
 
-    def scan_thread(self, adapter, tree, progress, btn):
-        found_devices = []
-        found_gpib_addrs = []
+    def _history_forward(self, _event) -> str:
+        if self.history_pos < len(self.history) - 1:
+            self.history_pos += 1
+            self.command_var.set(self.history[self.history_pos])
+        else:
+            self.history_pos = len(self.history)
+            self.command_var.set("")
+        return "break"
 
-        # Enforce scan preconditions (session-only; deliberately no ++savecfg).
-        # ++read_tmo_ms MUST be shorter than the 0.5s transport read timeout,
-        # otherwise late replies arrive in the NEXT iteration's read and cause
-        # phantom/duplicated devices at the wrong addresses.
-        adapter.write("++mode 1")
-        adapter.write("++auto 0")
-        adapter.write("++eos 3")
-        adapter.write("++eoi 1")
-        adapter.write("++read_tmo_ms 200")
-        time.sleep(0.2)
-        adapter.flush_input()
+    # -- teardown ----------------------------------------------------------
+    def shutdown(self) -> None:
+        self.stop_event.set()
+        super().shutdown()
+        try:
+            self.adapter.close()
+        except Exception as exc:
+            dprint(f"Error closing adapter: {exc}")
 
-        # Phase 1: fast presence detection via serial poll (IEEE-488.1).
-        # Every GPIB device answers spoll at the interface-chip level, so this
-        # is safe for pre-488.2 instruments and much faster on empty addresses.
-        # A valid spoll reply is a decimal status byte (0-255); anything else
-        # is stale data or an error string and is NOT treated as presence.
-        present = []
-        status_bytes = {}
-        for addr in range(31):
-            if not self.root.winfo_exists():
+
+# ==========================================================================
+# Database tab
+# ==========================================================================
+
+DB_COLUMNS = (
+    ("kind", "Type", 90), ("where", "Port / address", 170),
+    ("serial", "Adapter ID", 190), ("addr", "GPIB", 60),
+    ("state", "State", 100), ("stb", "Status byte", 140),
+    ("idn", "*IDN? response", 420), ("tc", "TC definition", 190),
+    ("last_seen", "Last seen", 160),
+)
+TC_COLUMNS = ("tc",)
+
+MATCH_COLUMNS = (
+    ("id", "ID", 55), ("kind", "Type", 90), ("addr", "GPIB", 60),
+    ("idn", "*IDN? response", 430), ("tc", "Matched definition", 260),
+)
+
+
+class DatabaseTab(QueuedFrame):
+    """Two panes: the recorded instruments, and the TestController integration
+    that annotates them. The integration is optional, so it gets its own
+    sub-tab rather than crowding the records with settings most people never
+    touch."""
+
+    def __init__(self, app: "App"):
+        super().__init__(app.notebook, padding=PAD)
+        self.app = app
+        self.config = load_config()
+        self.pending_updates: list = []
+        self.tc_enabled_var = tk.BooleanVar(value=bool(self.config.get("tc_enabled")))
+        self.tc_path_var = tk.StringVar(value=self.config.get("tc_path", ""))
+
+        self.inner = ttk.Notebook(self)
+        self.inner.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        self._build_records_pane()
+        self._build_testcontroller_pane()
+
+        self.apply_tc_visibility()
+        self.refresh()
+
+    # -- records -----------------------------------------------------------
+    def _build_records_pane(self) -> None:
+        pane = ttk.Frame(self.inner, padding=PAD)
+        self.inner.add(pane, text="Instruments")
+        pane.columnconfigure(0, weight=1)
+        pane.rowconfigure(1, weight=1)
+
+        bar = ttk.Frame(pane)
+        bar.grid(row=0, column=0, sticky="ew")
+        ttk.Button(bar, text="Refresh", command=self.refresh).pack(side="left")
+        ttk.Button(bar, text="Export CSV…",
+                   command=lambda: self.app.export_csv(None)).pack(side="left", padx=(PAD, 0))
+        ttk.Button(bar, text="Export JSON…",
+                   command=lambda: self.app.export_json(None)).pack(side="left", padx=(PAD, 0))
+        ttk.Button(bar, text="Edit label…",
+                   command=self.edit_selected).pack(side="left", padx=(PAD, 0))
+        ttk.Button(bar, text="Delete record(s)",
+                   command=self.delete_selected).pack(side="left", padx=(PAD, 0))
+        self.count_label = ttk.Label(bar, text="", foreground=MUTED)
+        self.count_label.pack(side="right")
+
+        table, self.tree = build_tree(pane, DB_COLUMNS, stretch=("idn",),
+                                      selectmode="extended")
+        table.grid(row=1, column=0, sticky="nsew", pady=(PAD, 0))
+        self.tree.tag_configure("found", foreground=OK_FG)
+        self.tree.tag_configure("missing", foreground="#666666")
+
+    def refresh(self) -> None:
+        self.tree.delete(*self.tree.get_children(""))
+        rows = fetch_all_devices()
+        for index, row in enumerate(rows):
+            (kind, where, serial_num, addr, idn, status, last_seen, tc_config, stb) = row
+            tag = "found" if (status or "").lower() == "found" else "missing"
+            self.tree.insert("", "end", iid=str(index), tags=(tag,),
+                             values=(kind or "", where or "", serial_num or "", addr,
+                                     status or "", decode_status_byte(stb), idn or "",
+                                     tc_config or "", last_seen or ""))
+        live = sum(1 for r in rows if (r[5] or "").lower() == "found")
+        self.count_label.configure(
+            text=f"{len(rows)} record(s), {live} last seen present")
+
+    def _selected_records(self):
+        out = []
+        for iid in self.tree.selection():
+            out.append((self.tree.set(iid, "addr"), self.tree.set(iid, "serial")))
+        return out
+
+    def delete_selected(self) -> None:
+        records = self._selected_records()
+        if not records:
+            messagebox.showwarning(APP_NAME, "Select at least one record to delete.")
+            return
+        count = len(records)
+        if not messagebox.askyesno(
+                "Confirm Delete",
+                f"Delete the {count} selected record{'s' if count > 1 else ''}?"):
+            return
+        delete_device_records(records)
+        self.refresh()
+        for tab in self.app.adapter_tabs.values():
+            tab.load_from_db()
+        self.app.set_status(f"Deleted {count} record(s)")
+
+    def edit_selected(self) -> None:
+        """A nickname is stored in the tc_config_file column when the
+        TestController feature is off, so a bench label survives without a
+        second schema migration."""
+        selection = self.tree.selection()
+        if len(selection) != 1:
+            messagebox.showinfo(APP_NAME, "Select exactly one record to edit.")
+            return
+        iid = selection[0]
+        if self.tc_enabled_var.get():
+            messagebox.showinfo(
+                APP_NAME,
+                "Turn TestController matching off before editing this field by hand - "
+                "a definition scan would overwrite it.")
+            return
+        dialog = FieldDialog(self, "Edit record",
+                             {"Label": self.tree.set(iid, "tc")})
+        if not dialog.result:
+            return
+        addr, serial_num = self.tree.set(iid, "addr"), self.tree.set(iid, "serial")
+        with sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT) as conn:
+            conn.execute("UPDATE devices SET tc_config_file = ? "
+                         "WHERE gpib_address = ? AND adapter_serial = ?",
+                         (dialog.result["Label"] or None, addr, serial_num))
+            conn.commit()
+        self.refresh()
+
+    # -- TestController ----------------------------------------------------
+    def _build_testcontroller_pane(self) -> None:
+        pane = ttk.Frame(self.inner, padding=PAD)
+        self.inner.add(pane, text="TestController")
+        pane.columnconfigure(0, weight=1)
+        pane.rowconfigure(1, weight=1)
+
+        settings = ttk.LabelFrame(pane, text="Device definitions", padding=PAD)
+        settings.grid(row=0, column=0, sticky="ew")
+        settings.columnconfigure(2, weight=1)
+        ttk.Checkbutton(settings, text="Match instruments to device definitions",
+                        variable=self.tc_enabled_var,
+                        command=self.toggle_testcontroller).grid(row=0, column=0, sticky="w")
+        ttk.Label(settings, text="Install folder").grid(row=0, column=1, sticky="w",
+                                                        padx=(PAD * 2, 4))
+        self.tc_entry = ttk.Entry(settings, textvariable=self.tc_path_var)
+        self.tc_entry.grid(row=0, column=2, sticky="ew")
+        self.tc_browse_btn = ttk.Button(settings, text="Browse…", command=self.browse_tc_path)
+        self.tc_browse_btn.grid(row=0, column=3, padx=(4, 0))
+        self.tc_scan_btn = ttk.Button(settings, text="Match devices",
+                                      command=self.match_devices)
+        self.tc_scan_btn.grid(row=0, column=4, padx=(PAD, 0))
+        ttk.Label(settings,
+                  text="Nothing is written to the TestController folder. Definitions are "
+                       "matched on #idString, which is compared against the *IDN? reply.",
+                  foreground=MUTED).grid(row=1, column=0, columnspan=5, sticky="w",
+                                         pady=(4, 0))
+        self.tc_status = ttk.Label(settings, text="", wraplength=1100, justify="left",
+                                   foreground=MUTED)
+        self.tc_status.grid(row=2, column=0, columnspan=5, sticky="w", pady=(4, 0))
+
+        table, self.match_tree = build_tree(pane, MATCH_COLUMNS, stretch=("idn",))
+        table.grid(row=1, column=0, sticky="nsew", pady=PAD)
+        self.match_tree.tag_configure("matched", foreground=OK_FG)
+        self.match_tree.tag_configure("unmatched", foreground="#666666")
+
+        actions = ttk.Frame(pane)
+        actions.grid(row=2, column=0, sticky="ew")
+        self.tc_accept_btn = ttk.Button(actions, text="Accept & update database",
+                                        command=self.accept_matches, state="disabled")
+        self.tc_accept_btn.pack(side="left")
+        ttk.Button(actions, text="Discard preview",
+                   command=self.discard_matches).pack(side="left", padx=(PAD, 0))
+        ttk.Label(actions, text="Matches are a preview until you accept them.",
+                  foreground=MUTED).pack(side="right")
+
+        self.tc_log = LogPane(pane, height=6)
+        self.tc_log.grid(row=3, column=0, sticky="nsew", pady=(PAD, 0))
+
+    def apply_tc_visibility(self) -> None:
+        """Hide the definition column in the records table when the feature is off."""
+        enabled = self.tc_enabled_var.get()
+        columns = [c[0] for c in DB_COLUMNS]
+        if not enabled:
+            columns = [c for c in columns if c not in TC_COLUMNS]
+        self.tree.configure(displaycolumns=columns)
+        state = "normal" if enabled else "disabled"
+        for widget in (self.tc_entry, self.tc_browse_btn, self.tc_scan_btn):
+            widget.configure(state=state)
+        if not enabled:
+            self.tc_accept_btn.configure(state="disabled")
+
+    def toggle_testcontroller(self) -> None:
+        enabled = self.tc_enabled_var.get()
+        self.config["tc_enabled"] = enabled
+        save_config(self.config)
+        self.apply_tc_visibility()
+        if enabled:
+            self.tc_log.write("TestController matching on. Point at the install folder, "
+                              "then press Match devices.")
+        else:
+            self.discard_matches()
+            self.tc_status.configure(text="")
+            self.tc_log.write("TestController matching off. Existing links stay in the "
+                              "database.")
+        self.refresh()
+
+    def browse_tc_path(self) -> None:
+        directory = filedialog.askdirectory(
+            parent=self, title="Select the TestController installation directory")
+        if not directory:
+            return
+        ok, problem = tc_validate_install(directory)
+        if not ok:
+            messagebox.showerror("Validation Error", problem, parent=self)
+            return
+        self.tc_path_var.set(directory)
+        self.config["tc_path"] = directory
+        save_config(self.config)
+        self.tc_log.write(f"TestController install: {directory}")
+
+    def match_devices(self) -> None:
+        dev_path = tc_devices_path(self.tc_path_var.get())
+        if not dev_path:
+            messagebox.showerror(
+                "Error", "Could not find a 'Devices' folder in the selected "
+                         "TestController path.", parent=self)
+            return
+        self.match_tree.delete(*self.match_tree.get_children(""))
+        self.pending_updates = []
+
+        configs = tc_read_definitions(dev_path)
+        self.tc_log.write(f"Read {len(configs)} definition file(s) from {dev_path}")
+
+        try:
+            devices = fetch_devices_for_matching()
+        except sqlite3.Error as exc:
+            messagebox.showerror("Database Error", str(exc), parent=self)
+            return
+
+        matched = 0
+        for dev_id, kind, addr, idn in devices:
+            idn = idn or "Unknown"
+            filename = tc_match(idn, configs)
+            if filename:
+                matched += 1
+            self.pending_updates.append((filename, dev_id))
+            self.match_tree.insert(
+                "", "end", iid=str(dev_id),
+                tags=("matched" if filename else "unmatched",),
+                values=(dev_id, kind or "", addr, idn, filename or "Not found"))
+
+        self.tc_status.configure(
+            text=f"{matched} of {len(devices)} record(s) matched a definition file. "
+                 f"Nothing is saved until you accept.")
+        self.tc_accept_btn.configure(state="normal" if self.pending_updates else "disabled")
+        if not devices:
+            self.tc_log.write("No instrument records in the database yet - scan a bus first.")
+
+    def accept_matches(self) -> None:
+        if not self.pending_updates:
+            return
+        batch_update_tc_configs(self.pending_updates)
+        count = len(self.pending_updates)
+        self.discard_matches()
+        self.refresh()
+        for tab in self.app.adapter_tabs.values():
+            tab.load_from_db()
+        self.tc_log.write(f"Wrote definition links for {count} record(s).")
+        self.app.set_status("TestController links updated")
+
+    def discard_matches(self) -> None:
+        self.pending_updates = []
+        self.match_tree.delete(*self.match_tree.get_children(""))
+        self.tc_accept_btn.configure(state="disabled")
+
+    def focus_testcontroller(self) -> None:
+        self.inner.select(1)
+
+    def on_event(self, kind: str, *args) -> None:
+        if kind == "log":
+            self.tc_log.write(args[0])
+
+
+# ==========================================================================
+# Root window
+# ==========================================================================
+
+class App(tk.Tk):
+    def __init__(self, db_path: str):
+        super().__init__()
+        global DB_NAME
+        DB_NAME = db_path
+        init_db()
+
+        self.title(f"{APP_NAME} - {APP_TITLE} {VERSION}")
+        self.geometry("1280x800")
+        self.minsize(980, 600)
+        self.adapter_tabs: dict[str, AdapterTab] = {}
+
+        try:
+            style = ttk.Style(self)
+            for preferred in ("clam", "vista", "aqua"):
+                if preferred in style.theme_names():
+                    style.theme_use(preferred)
+                    break
+            style.configure("Treeview", rowheight=22)
+        except tk.TclError:
+            pass
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=PAD, pady=(PAD, 0))
+
+        self.connections = ConnectionsTab(self)
+        self.notebook.add(self.connections, text="Controllers")
+        self.database_tab = DatabaseTab(self)
+        self.notebook.add(self.database_tab, text="Database")
+
+        self.status = ttk.Label(self, text=f"Database: {DB_NAME}", anchor="w",
+                                relief="sunken", padding=(PAD, 2))
+        self.status.pack(fill="x", side="bottom")
+
+        self._build_menu()
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
+        self.bind("<Control-w>", lambda _e: self.close_current_tab())
+        self.bind("<F5>", lambda _e: self.connections.start())
+
+    def _build_menu(self) -> None:
+        menu = tk.Menu(self)
+        file_menu = tk.Menu(menu, tearoff=0)
+        file_menu.add_command(label="Open database…", command=self.open_database)
+        file_menu.add_separator()
+        file_menu.add_command(label="Export JSON…", command=lambda: self.export_json(None))
+        file_menu.add_command(label="Export CSV…", command=lambda: self.export_csv(None))
+        file_menu.add_separator()
+        file_menu.add_command(label="Quit", command=self.quit_app)
+        menu.add_cascade(label="File", menu=file_menu)
+
+        scan_menu = tk.Menu(menu, tearoff=0)
+        scan_menu.add_command(label="Find controllers", accelerator="F5",
+                              command=lambda: self.connections.start())
+        scan_menu.add_command(label="Add controller by address…",
+                              command=lambda: self.connections.add_manual())
+        scan_menu.add_command(label="Scan the current bus",
+                              command=self.scan_current_tab)
+        scan_menu.add_separator()
+        scan_menu.add_command(label="Close this tab", accelerator="Ctrl+W",
+                              command=self.close_current_tab)
+        menu.add_cascade(label="Scan", menu=scan_menu)
+
+        tools_menu = tk.Menu(menu, tearoff=0)
+        tools_menu.add_command(label="TestController integration",
+                               command=self.open_testcontroller)
+        menu.add_cascade(label="Tools", menu=tools_menu)
+
+        help_menu = tk.Menu(menu, tearoff=0)
+        help_menu.add_command(label="About", command=self.about)
+        menu.add_cascade(label="Help", menu=help_menu)
+        self.configure(menu=menu)
+
+    # -- tabs --------------------------------------------------------------
+    def open_adapter(self, adapter: PrologixAdapter) -> None:
+        existing = self.adapter_tabs.get(adapter.serial_num)
+        if existing is not None:
+            adapter.close()
+            self.notebook.select(existing)
+            return
+        tab = AdapterTab(self, adapter)
+        self.adapter_tabs[adapter.serial_num] = tab
+        self.notebook.add(tab, text=f"{adapter.adapter_type}: {adapter.port_or_ip}")
+        self.notebook.select(tab)
+        self.set_status(f"Connected to {adapter.port_or_ip}")
+
+    def focus_adapter_tab(self, serial_num: str) -> None:
+        tab = self.adapter_tabs.get(serial_num)
+        if tab is not None:
+            self.notebook.select(tab)
+
+    def close_adapter_tab(self, serial_num: str) -> None:
+        tab = self.adapter_tabs.pop(serial_num, None)
+        if tab is None:
+            return
+        tab.shutdown()
+        self.notebook.forget(tab)
+        tab.destroy()
+        self.connections.refresh()
+        self.set_status("Controller closed")
+
+    def close_current_tab(self) -> None:
+        try:
+            current = self.notebook.nametowidget(self.notebook.select())
+        except tk.TclError:
+            return
+        for serial_num, tab in list(self.adapter_tabs.items()):
+            if tab is current:
+                self.close_adapter_tab(serial_num)
                 return
 
-            adapter.flush_input()
-            adapter.write(f"++spoll {addr}")
-            response = adapter.read().strip()
-            dprint(f"spoll {addr}: '{response}'")
+    def current_adapter_tab(self) -> Optional[AdapterTab]:
+        try:
+            current = self.notebook.nametowidget(self.notebook.select())
+        except tk.TclError:
+            return None
+        return current if isinstance(current, AdapterTab) else None
 
-            if response.isdigit() and 0 <= int(response) <= 255:
-                present.append(addr)
-                status_bytes[addr] = int(response)
+    def scan_current_tab(self) -> None:
+        tab = self.current_adapter_tab()
+        if tab is None:
+            messagebox.showinfo(APP_NAME, "Open a controller tab first.")
+            return
+        tab.start_scan()
 
-            if self.root.winfo_exists():
-                self.root.after(0, lambda val=addr: progress.configure(value=val))
+    def open_testcontroller(self) -> None:
+        self.notebook.select(self.database_tab)
+        self.database_tab.focus_testcontroller()
 
-        dprint(f"Present addresses: {present}")
+    def set_status(self, text: str) -> None:
+        self.status.configure(text=f"{text}   ·   {DB_NAME}")
 
-        # Phase 2: identify only the devices that answered the poll
-        for addr in present:
-            if not self.root.winfo_exists():
-                return
+    # -- files -------------------------------------------------------------
+    def open_database(self) -> None:
+        global DB_NAME
+        path = filedialog.asksaveasfilename(
+            title="Open or create a scanner database", defaultextension=".db",
+            initialfile="gpib_devices.db", confirmoverwrite=False,
+            filetypes=[("SQLite", "*.db *.sqlite3 *.sqlite"), ("All files", "*.*")])
+        if not path:
+            return
+        for serial_num in list(self.adapter_tabs):
+            self.close_adapter_tab(serial_num)
+        DB_NAME = path
+        init_db()
+        self.connections.live.clear()
+        self.connections.refresh()
+        self.database_tab.discard_matches()
+        self.database_tab.refresh()
+        self.set_status("Database opened")
 
-            adapter.flush_input()
-            adapter.write(f"++addr {addr}")
-            adapter.write("*IDN?")
-            adapter.write("++read eoi")
-
-            response = adapter.read().strip()
-            dprint(f"*IDN? {addr}: '{response}'")
-
-            idn = response if response else "(present, no *IDN? response - pre-488.2 device)"
-            found_gpib_addrs.append(addr)
-            found_devices.append((adapter.adapter_type, adapter.port_or_ip, adapter.serial_num, addr, idn, "Found", status_bytes.get(addr)))
-
-        upsert_devices_batch(found_devices)
-        mark_missing_devices(adapter.serial_num, found_gpib_addrs)
-        
-        if self.root.winfo_exists():
-            self.root.after(0, lambda: self.finish_scan(adapter.serial_num, tree, progress, btn))
-
-    def finish_scan(self, serial_num, tree, progress, btn):
-        progress["value"] = 30
-        btn.config(state="normal")
-        self.populate_adapter_tree(tree, serial_num)
-        self.refresh_db_view()
-        messagebox.showinfo("Scan Complete", f"Scan finished for adapter {serial_num}. Database updated.")
-
-    def export_csv(self, adapter_serial=None):
+    def export_csv(self, adapter_serial: Optional[str] = None) -> None:
         rows = fetch_all_devices(adapter_serial)
         if not rows:
             messagebox.showwarning("Export Empty", "No data available to export.")
             return
-            
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".csv", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")], title="Save Export as CSV"
-        )
-        if filepath:
-            try:
-                with open(filepath, mode='w', newline='', encoding='utf-8') as file:
-                    writer = csv.writer(file)
-                    writer.writerow(["Adapter Type", "Connection Port/IP", "Adapter Serial", "GPIB Address", "IDN Response", "Status", "Last Seen", "TC Config File", "Status Byte"])
-                    writer.writerows(rows)
-                messagebox.showinfo("Success", f"Data exported successfully to {filepath}")
-            except Exception as e:
-                messagebox.showerror("Export Error", f"Failed to save CSV:\n{e}")
+        path = filedialog.asksaveasfilename(
+            title="Export records as CSV", defaultextension=".csv",
+            initialfile="gpib-devices.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["Adapter Type", "Connection Port/IP", "Adapter Serial",
+                                 "GPIB Address", "IDN Response", "Status", "Last Seen",
+                                 "TC Config File", "Status Byte"])
+                writer.writerows(rows)
+        except OSError as exc:
+            messagebox.showerror("Export Error", f"Could not write {path}:\n{exc}")
+            return
+        self.set_status(f"Exported {len(rows)} record(s) to {path}")
 
-    def export_json(self, adapter_serial=None):
+    def export_json(self, adapter_serial: Optional[str] = None) -> None:
         rows = fetch_all_devices(adapter_serial)
         if not rows:
             messagebox.showwarning("Export Empty", "No data available to export.")
             return
+        path = filedialog.asksaveasfilename(
+            title="Export records as JSON", defaultextension=".json",
+            initialfile="gpib-devices.json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        keys = ["adapter_type", "connection_port", "adapter_serial", "gpib_address",
+                "idn_response", "status", "last_seen", "tc_config_file", "status_byte"]
+        data = []
+        for row in rows:
+            entry = dict(zip(keys, row))
+            entry["status_byte_decoded"] = decode_status_byte(row[8])
+            data.append(entry)
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+        except OSError as exc:
+            messagebox.showerror("Export Error", f"Could not write {path}:\n{exc}")
+            return
+        self.set_status(f"Exported {len(rows)} record(s) to {path}")
 
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".json", filetypes=[("JSON files", "*.json"), ("All files", "*.*")], title="Save Export as JSON"
-        )
-        if filepath:
-            keys = ["adapter_type", "connection_port", "adapter_serial", "gpib_address",
-                    "idn_response", "status", "last_seen", "tc_config_file", "status_byte"]
-            data = []
-            for row in rows:
-                entry = dict(zip(keys, row))
-                entry["status_byte_decoded"] = decode_status_byte(row[8])
-                data.append(entry)
-            try:
-                with open(filepath, mode='w', encoding='utf-8') as file:
-                    json.dump(data, file, indent=2)
-                messagebox.showinfo("Success", f"Data exported successfully to {filepath}")
-            except Exception as e:
-                messagebox.showerror("Export Error", f"Failed to save JSON:\n{e}")
+    def about(self) -> None:
+        messagebox.showinfo(
+            f"About {APP_NAME}",
+            f"{APP_NAME} {VERSION} - {APP_TITLE}\n\n"
+            "Finds Prologix GPIB-USB and GPIB-ETHERNET controllers, walks the GPIB\n"
+            "bus behind each one, and keeps a SQLite record of what was found and\n"
+            "when.\n\n"
+            "Ethernet discovery uses the NetFinder UDP broadcast. Bus scans\n"
+            "serial-poll every address first, then ask the responders for *IDN?,\n"
+            "so pre-488.2 instruments are still detected.\n\n"
+            "No VISA runtime required.")
 
-dprint("Classes loaded. Launching application...")
+    def quit_app(self) -> None:
+        for serial_num in list(self.adapter_tabs):
+            self.close_adapter_tab(serial_num)
+        self.connections.shutdown()
+        self.database_tab.shutdown()
+        self.destroy()
 
-def main():
+
+def main(argv: Optional[list] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="pos", description=f"{APP_NAME} - {APP_TITLE}")
+    parser.add_argument("--db", default=DEFAULT_DB_PATH,
+                        help="SQLite database to open (default: alongside the program)")
+    parser.add_argument("--debug", action="store_true", help="verbose console output")
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} {VERSION}")
+    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+    global DEBUG_MODE
+    DEBUG_MODE = DEBUG_MODE or args.debug
+
     dprint("Initializing Tkinter root window...")
-    root = tk.Tk()
-    app = PrologixMultiScannerApp(root)
-    dprint("Handing control to Tkinter mainloop. The GUI should now be visible on your screen.")
-    root.mainloop()
+    app = App(str(Path(args.db).expanduser()))
+    dprint("Handing control to Tkinter mainloop.")
+    app.mainloop()
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
